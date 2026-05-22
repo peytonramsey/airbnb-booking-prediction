@@ -1,0 +1,761 @@
+---
+title: "eda: popincourt narrative exploration"
+format: html
+---
+
+```{r}
+#| include: false
+library(tidyverse)
+library(tidymodels)
+library(vetiver)
+library(plumber)
+library(tidytable)
+library(bonsai)
+library(lightgbm)
+library(pins)
+library(beepr)
+library(GPfit)
+library(lhs)
+library(dials)
+library(caret)
+library(parallel)
+library(vip)
+library(geosphere)
+library(ggplot2)
+library(sf)
+library(rnaturalearth)
+```
+
+## phase 1: setup & first look
+
+```{r}
+# load data with tidytable
+airbnb_popincourt <- fread("C:/Users/ramse/msba-courses/ds 810/airbnb-project/part-two/data/airbnb-project-paris-sampled-Popincourt.csv")
+
+# clean data
+airbnb_popincourt <- airbnb_popincourt %>%
+    mutate(
+        price = as.numeric(gsub("[$,]", "", price)),
+        amenity_count = lengths(strsplit(as.character(amenities), ",")),
+        high_booking = as.factor(high_booking)
+    )
+
+# check data types
+glimpse(airbnb_popincourt)
+
+# check dimensions
+dim(airbnb_popincourt)
+
+# check na values per column
+colSums(is.na(airbnb_popincourt))
+```
+
+### checkpoint b: questions from google form submission
+
+```{r}
+# how many airbnbs in popincourt are high_booking?
+sum(airbnb_popincourt$high_booking == 1)
+
+# mean price of airbnbs
+mean(airbnb_popincourt$price)
+
+# median price of airbnbs
+median(airbnb_popincourt$price)
+
+# st dev of price
+sd(airbnb_popincourt$price)
+
+# log price
+airbnb_popincourt$log_price <- log(airbnb_popincourt$price)
+
+# log st dev of price
+sd(airbnb_popincourt$log_price)
+
+# histogram of log price
+ggplot(airbnb_popincourt, aes(x = log_price)) +
+    geom_histogram(bins = 50) +
+    theme_minimal()
+
+# % of hosts are superhosts
+# host_is_superhost is currently a character column with "true" and "false" values
+# convert to binary in mutate()
+airbnb_popincourt <- airbnb_popincourt %>%
+    mutate(host_is_superhost = as.numeric(host_is_superhost == "true"))
+
+# compare the 0's to 1's in host_is_superhost
+table(airbnb_popincourt$host_is_superhost)
+```
+
+```{r}
+# set.seed(21)
+# train_idx <- sample(nrow(airbnb_popincourt), 0.8 * nrow(airbnb_popincourt))
+# train <- airbnb_popincourt[train_idx, ]
+# test <- airbnb_popincourt[-train_idx, ]
+
+# train$high_booking <- as.integer(train$high_booking) - 1L
+# test$high_booking <- as.integer(test$high_booking) - 1L
+
+# model <- glm(high_booking ~ log_price + host_listings_count + reviews_per_month +
+#               minimum_nights + maximum_nights + review_scores_rating +
+#               review_scores_cleanliness + review_scores_checkin +
+#               review_scores_communication + review_scores_location +
+#               review_scores_value + accommodates + bedrooms + beds +
+#               bathrooms + amenity_count + latitude_cleansed +
+#               longitude_cleansed + host_response_rate,
+#             data = train, family = binomial(link = "logit"))
+
+# probabilities <- predict(model, newdata = test, type = "response")
+# predictions   <- ifelse(probabilities > 0.5, 1, 0)
+
+# table(Predicted = predictions, Actual = test$high_booking)
+# summary(model)
+```
+
+## phase 2: target variable
+
+```{r}
+# check distribution of high_booking
+table(airbnb_popincourt$high_booking)
+```
+
+## phase 3: narrative a - gentrification gradient
+
+```{r}
+# plot listings on a map
+ggplot(airbnb_popincourt, aes(x = longitude, y = latitude, color = high_booking)) +
+    geom_point(alpha = 0.5) +
+    theme_minimal()
+```
+
+```{r}
+#| layout-ncol: 2
+# hexbin map: avg high_booking rate per hex (0 = low, 1 = high)
+airbnb_popincourt %>%
+    mutate(high_booking_num = as.numeric(as.character(high_booking))) %>%
+    ggplot(aes(x = longitude, y = latitude, z = high_booking_num)) +
+    stat_summary_hex(bins = 30, fun = mean) +
+    scale_fill_viridis_c(option = "B", name = "Avg High Booking Rate") +
+    labs(
+        title = "High Booking Rate Across Popincourt",
+        x = "Longitude", y = "Latitude"
+    ) +
+    theme_minimal()
+
+# hexbin map: avg price per hex
+airbnb_popincourt %>%
+    ggplot(aes(x = longitude, y = latitude, z = price)) +
+    stat_summary_hex(bins = 30, fun = mean) +
+    scale_fill_viridis_c(option = "B", name = "Avg Price (EUR)") +
+    labs(
+        title = "Average Listing Price Across Popincourt",
+        x = "Longitude", y = "Latitude"
+    ) +
+    theme_minimal()
+```
+
+```{r}
+# alignment overlay: hexes where price and booking rate are within 1 SD of each other
+df_hex_base <- airbnb_popincourt %>%
+    mutate(high_booking_num = as.numeric(as.character(high_booking)))
+
+# extract pre-computed hex data from both summary plots
+p_booking <- ggplot(df_hex_base, aes(x = longitude, y = latitude, z = high_booking_num)) +
+    stat_summary_hex(bins = 30, fun = mean)
+
+p_price <- ggplot(df_hex_base, aes(x = longitude, y = latitude, z = price)) +
+    stat_summary_hex(bins = 30, fun = mean)
+
+hex_booking <- ggplot_build(p_booking)$data[[1]] %>%
+    transmute(x, y, booking_rate = value)
+
+hex_price <- ggplot_build(p_price)$data[[1]] %>%
+    transmute(x, y, avg_price = value)
+
+# join on hex centers, z-score both, flag where |diff| <= 1 SD
+hex_combined <- inner_join(hex_booking, hex_price, by = c("x", "y")) %>%
+    mutate(
+        booking_z = as.numeric(scale(booking_rate)),
+        price_z   = as.numeric(scale(avg_price)),
+        aligned   = abs(booking_z - price_z) <= 1
+    )
+
+ggplot(hex_combined, aes(x = x, y = y, fill = aligned)) +
+    geom_tile() +
+    scale_fill_manual(
+        values = c("TRUE" = "#FFB347", "FALSE" = "#2D1B69"),
+        labels = c("TRUE" = "Aligned (< 1 SD apart)", "FALSE" = "Divergent"),
+        name = NULL
+    ) +
+    coord_equal() +
+    labs(
+        title = "Price-Booking Alignment Across Popincourt",
+        subtitle = "Highlighted hexes: avg price and high-booking rate move together (within 1 SD)",
+        x = "Longitude", y = "Latitude"
+    ) +
+    theme_minimal()
+```
+
+```{r}
+# high-booking listings vs. non-high-booking
+ggplot(airbnb_popincourt, aes(x = longitude, y = latitude, color = high_booking)) +
+    geom_hex(bins = 30) +
+    facet_wrap(~high_booking, labeller = labeller(high_booking = c("0" = "Low Booking", "1" = "High Booking"))) +
+    scale_fill_viridis_c(option = "B") +
+    labs(
+        title = "Spatial Distribution by Booking Status",
+        x = "Longitude", y = "Latitude"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "none")
+```
+
+### composite score using three gentrification anchors
+
+Anchor Coordinates (approx.)	
+
+- Rue Oberkampf: 48.8667, 2.3667
+- Place de la Bastille: 48.8533, 2.3692
+- Rue de la Roquette: 48.8567, 2.3790
+
+```{r}
+airbnb_popincourt <- airbnb_popincourt %>%
+    mutate(
+        distance_to_oberkampf = distHaversine(
+            cbind(longitude, latitude),
+            c(2.3667, 48.8667)
+        ),
+        distance_to_bastille = distHaversine(
+            cbind(longitude, latitude),
+            c(2.3692, 48.8533)
+        ),
+        distance_to_roquette = distHaversine(
+            cbind(longitude, latitude),
+            c(2.3790, 48.8567)
+        )
+    )
+
+summary(airbnb_popincourt$distance_to_oberkampf)
+summary(airbnb_popincourt$distance_to_bastille)
+summary(airbnb_popincourt$distance_to_roquette)
+```
+
+### use price as a ground-truth gentrification validator
+
+```{r}
+# step 1: inspect the outliers first
+summary(airbnb_popincourt$price)
+quantile(airbnb_popincourt$price, probs = c(0.01, 0.25, 0.5, 0.75, 0.95, 0.99), na.rm = TRUE)
+
+# step 2: remove implausible prices
+p99 <- quantile(airbnb_popincourt$price, 0.99, na.rm = TRUE)
+
+airbnb_popincourt <- airbnb_popincourt %>%
+    filter(price > 0 & price <= p99)
+
+# step 3: create quantile-based price bins (thirds of actual distribution)
+airbnb_popincourt <- airbnb_popincourt %>%
+    mutate(
+        price_bin = case_when(
+            price < quantile(price, 0.33, na.rm = TRUE) ~ "budget",
+            price < quantile(price, 0.67, na.rm = TRUE) ~ "mid",
+            TRUE ~ "premium"
+        )
+    )
+
+# step 4: validate, bins should be roughly equal in size
+table(airbnb_popincourt$price_bin)
+
+# step 5: check avg high_booking rate per bin, does premium price = higher booking?
+airbnb_popincourt %>%
+    group_by(price_bin) %>%
+    summarise(
+        count = n(),
+        avg_high_booking = mean(as.integer(high_booking) - 1L, na.rm = TRUE),
+        avg_price = mean(price, na.rm = TRUE)
+    )
+
+# plot price bins on a density map
+ggplot(airbnb_popincourt, aes(x = longitude, y = latitude, color = price_bin)) +
+    geom_point(alpha = 0.5) +
+    theme_minimal()
+
+# facet by price_bin to see WHERE each tier concentrates spatially
+ggplot(airbnb_popincourt, aes(x = longitude, y = latitude)) +
+    stat_density_2d(aes(fill = after_stat(density)), geom = "raster", contour = FALSE) +
+    scale_fill_viridis_c(option = "magma") +
+    facet_wrap(~price_bin) +
+    theme_minimal() +
+    labs(title = "Listing Density by Price Tier", fill = "Density")
+```
+
+**Findings:**
+
+This is a 32 percentage point spread between budget and premium. It's clean, monotonic, and statistically meaningful. In a gentrifying neighborhood where premium listings are multiplying, the budget listings are winning the actual bookings. This is a compelling, counterintuitive finding.
+
+### k-means clustering on long/lat coordinates
+
+```{r}
+#| eval: false
+#| echo: true
+# choosing optimal k
+# using elbow method to determine optimal number of clusters
+airbnb_popincourt_longlat <- airbnb_popincourt %>%
+    select(longitude, latitude) %>%
+    na.omit()
+
+# elbow method
+wss <- sapply(1:10, function(k) {
+    kmeans(airbnb_popincourt_longlat, k, nstart = 10)$tot.withinss
+})
+
+# plot elbow curve
+plot(1:10, wss,
+    type = "b",
+    xlab = "Number of Clusters (k)",
+    ylab = "Within-cluster sum of squares",
+    main = "Elbow Method for Optimal k"
+)
+
+
+# using k = 3
+kmeans_result <- kmeans(airbnb_popincourt_longlat, centers = 3, nstart = 10)
+airbnb_popincourt$cluster <- as.factor(kmeans_result$cluster)
+
+# plot clusters on a map
+ggplot(airbnb_popincourt, aes(x = longitude, y = latitude, color = cluster)) +
+    geom_point(alpha = 0.5) +
+    theme_minimal()
+
+# using k = 4
+kmeans_result <- kmeans(airbnb_popincourt_longlat, centers = 4, nstart = 10)
+airbnb_popincourt$cluster <- as.factor(kmeans_result$cluster)
+
+# plot clusters on a map
+ggplot(airbnb_popincourt, aes(x = longitude, y = latitude, color = cluster)) +
+    geom_point(alpha = 0.5) +
+    theme_minimal()
+
+# check if clusters have meaningful different average high_booking, prices, and reviews_per_month
+airbnb_popincourt %>%
+    group_by(cluster) %>%
+    summarise(
+        avg_high_booking = mean(as.integer(high_booking) - 1L, na.rm = TRUE),
+        avg_price = mean(price, na.rm = TRUE),
+        avg_reviews_per_month = mean(reviews_per_month, na.rm = TRUE)
+    )
+```
+
+**Findings:**
+
+The correlation with high_booking is 0.018, which is essentially zero. Listing density as a gentrification proxy does not predict booking in this market.
+
+**Phase 3 Verdict:**
+
+In one of Paris's most gentrifying neighborhoods, premium-priced listings are multiplying as hosts chase the 'bobo' premium, but the data shows budget listings are booking at 2.5x the rate of premium ones. Gentrification may be raising prices, but it's pricing hosts out of their own bookings.
+
+---
+
+## additional gentrification analyses
+
+### professional host takeover
+
+Multi-listing hosts are considered one of the clearest signals of Airbnb-driven gentrification, representing the shift from casual home-sharing to commercial investment.
+
+```{r}
+# step 1: classify host type using host_listings_count
+airbnb_popincourt <- airbnb_popincourt %>%
+    mutate(
+        host_type = case_when(
+            host_listings_count == 1 ~ "casual",
+            host_listings_count >= 2 & host_listings_count <= 5 ~ "semi-pro",
+            host_listings_count > 5 ~ "commercial",
+            TRUE ~ NA_character_
+        )
+    )
+
+# check distribution, what share of hosts are commercial?
+table(airbnb_popincourt$host_type, useNA = "ifany")
+
+# step 2: core booking and price comparison by host type
+airbnb_popincourt %>%
+    filter(!is.na(host_type)) %>%
+    group_by(host_type) %>%
+    summarise(
+        count = n(),
+        pct_of_market = n() / nrow(filter(airbnb_popincourt, !is.na(host_type))),
+        avg_high_booking = mean(as.integer(high_booking) - 1L, na.rm = TRUE),
+        avg_price = mean(price, na.rm = TRUE),
+        median_price = median(price, na.rm = TRUE)
+    ) %>%
+    arrange(desc(avg_price))
+# what to look for: commercial hosts pricing higher but booking lower than casual hosts
+
+# step 3: cross-tabulate host type × price bin
+# do commercial hosts cluster in the premium tier?
+airbnb_popincourt %>%
+    filter(!is.na(host_type), !is.na(price_bin)) %>%
+    group_by(host_type, price_bin) %>%
+    summarise(
+        count = n(),
+        avg_high_booking = mean(as.integer(high_booking) - 1L, na.rm = TRUE)
+    ) %>%
+    arrange(host_type, price_bin)
+# key finding to look for: commercial + premium = lowest booking rate
+
+# step 4: revenue concentration - do commercial hosts dominate estimated revenue?
+# estimate revenue proxy: price × reviews_per_month (reviews ~ bookings)
+airbnb_popincourt <- airbnb_popincourt %>%
+    mutate(
+        revenue_proxy = price * reviews_per_month
+    )
+
+airbnb_popincourt %>%
+    filter(!is.na(host_type)) %>%
+    group_by(host_type) %>%
+    summarise(
+        total_revenue_proxy = sum(revenue_proxy, na.rm = TRUE),
+        pct_of_total = sum(revenue_proxy, na.rm = TRUE) / sum(airbnb_popincourt$revenue_proxy, na.rm = TRUE)
+    )
+# if Popincourt diverges, that IS the story
+
+# step 5: superhost status within host type
+# are superhosts concentrated among casual or commercial hosts?
+airbnb_popincourt %>%
+    filter(!is.na(host_type), !is.na(host_is_superhost)) %>%
+    group_by(host_type, host_is_superhost) %>%
+    summarise(
+        count = n(),
+        avg_high_booking = mean(as.integer(high_booking) - 1L, na.rm = TRUE),
+        avg_price = mean(price, na.rm = TRUE)
+    ) %>%
+    arrange(host_type, host_is_superhost)
+# what to look for: does superhost status help casual hosts more than commercial ones?
+
+# step 6: spatial map - where do commercial hosts cluster?
+ggplot(
+    airbnb_popincourt %>% filter(!is.na(host_type)),
+    aes(x = longitude, y = latitude, color = host_type)
+) +
+    geom_point(alpha = 0.4, size = 0.8) +
+    scale_color_manual(values = c(
+        "casual" = "#2196F3",
+        "semi-pro" = "#FF9800",
+        "commercial" = "#F44336"
+    )) +
+    theme_minimal() +
+    labs(
+        title = "Host Type Distribution - Popincourt",
+        color = "Host Type"
+    )
+# what to look for: do commercial hosts cluster in the gentrified northwest?
+# if yes, that spatially anchors the gentrification story
+
+# step 7: density map faceted by host type
+ggplot(
+    airbnb_popincourt %>% filter(!is.na(host_type)),
+    aes(x = longitude, y = latitude)
+) +
+    stat_density_2d(aes(fill = after_stat(density)),
+        geom = "raster",
+        contour = FALSE
+    ) +
+    scale_fill_viridis_c(option = "magma") +
+    facet_wrap(~host_type) +
+    theme_minimal() +
+    labs(
+        title = "Listing Density by Host Type - Popincourt",
+        fill = "Density"
+    )
+```
+
+Commercial hosts charge 50% more than casual hosts but book at less than one-quarter the rate. The price-booking inversion is stark and monotonic across all three tiers.
+
+The commercial + premium combination is the single worst performing segment in the entire dataset at 9.5%. Casual budget listings outperform it by a factor of 6x.
+
+Despite only being 7.5% of hosts, commercial hosts fail to dominate revenue the way they do in other markets, as casual hosts have retained control of earnings. This is a direct, data-backed rebuttal to the standard gentrification-via-Airbnb narrative and is your headline finding.
+
+Superhost status consistently correlates with higher pricing and lower booking rate across every host type. Superhosts are not failing because of quality, they are pricing themselves out of bookings. The commercial superhost is the most extreme case: the highest prices in the dataset ($162 avg) and the lowest booking rate (4.9%).
+
+**Verdict:**
+
+Gentrification in Popincourt has produced an army of overpriced professional listings that the market is quietly rejecting. Commercial hosts, the clearest signal of investment-driven gentrification, charge the most, book the least, and capture a fraction of the revenue that theory predicts. Meanwhile, casual local hosts running budget listings dominate both bookings and earnings. In one of Paris's most gentrified neighborhoods, the local host is winning.
+
+---
+
+# EDA For the Presentation - based on report and our goal
+
+---
+
+## analysis 1: entire home conversion rate by host type and year
+
+Commercial hosts acquiring entire apartments is one of the clearest mechanisms of Airbnb-driven gentrification. This analysis tracks whether entire-home listings by commercial hosts are growing over time and whether that growth correlates with declining booking rates - the key question for an investor deciding whether to pursue an entire-home acquisition strategy in Popincourt.
+
+```{r}
+# parse snapshot year from the date column
+airbnb_popincourt <- airbnb_popincourt %>%
+    mutate(
+        snapshot_year = as.integer(format(as.Date(date), "%Y"))
+    )
+
+# share of each host type's listings that are entire home vs. private/shared room
+airbnb_popincourt %>%
+    filter(!is.na(host_type)) %>%
+    mutate(entire_home = room_type == "Entire home/apt") %>%
+    group_by(host_type) %>%
+    summarise(
+        total_listings = n(),
+        entire_home_count = sum(entire_home, na.rm = TRUE),
+        pct_entire_home = mean(entire_home, na.rm = TRUE)
+    ) %>%
+    arrange(desc(pct_entire_home))
+```
+
+```{r}
+# booking rate for entire-home listings by host type and year
+entire_home_by_year <- airbnb_popincourt %>%
+    filter(
+        !is.na(host_type),
+        room_type == "Entire home/apt",
+        !is.na(snapshot_year)
+    ) %>%
+    group_by(host_type, snapshot_year) %>%
+    summarise(
+        n = n(),
+        avg_booking_rate = mean(as.integer(high_booking) - 1L, na.rm = TRUE),
+        avg_price = mean(price, na.rm = TRUE),
+        .groups = "drop"
+    )
+
+entire_home_by_year
+
+# line chart: booking rate over time by host type (entire homes only)
+ggplot(entire_home_by_year, aes(
+    x = snapshot_year, y = avg_booking_rate,
+    color = host_type, group = host_type
+)) +
+    geom_line(linewidth = 1.1) +
+    geom_point(aes(size = n), alpha = 0.7) +
+    scale_color_manual(values = c(
+        "casual" = "#2196F3",
+        "semi-pro" = "#FF9800",
+        "commercial" = "#F44336"
+    )) +
+    scale_y_continuous(labels = scales::percent_format()) +
+    labs(
+        title = "Entire Home Booking Rate by Host Type and Year",
+        subtitle = "Only entire home/apt listings included",
+        x = "Year", y = "Avg Booking Rate",
+        color = "Host Type", size = "Listing Count"
+    ) +
+    theme_minimal()
+```
+
+```{r}
+# listing volume by host type and year (entire homes) - are commercial hosts growing?
+ggplot(entire_home_by_year, aes(
+    x = snapshot_year, y = n,
+    fill = host_type
+)) +
+    geom_col(position = "fill") +
+    scale_fill_manual(values = c(
+        "casual" = "#2196F3",
+        "semi-pro" = "#FF9800",
+        "commercial" = "#F44336"
+    )) +
+    scale_y_continuous(labels = scales::percent_format()) +
+    labs(
+        title = "Share of Entire Home Listings by Host Type Over Time",
+        x = "Year", y = "Share of Listings", fill = "Host Type"
+    ) +
+    theme_minimal()
+```
+
+**Findings:**
+
+Entire-home listings dominate across all host types - 91.5% of casual listings and 90.6% of commercial listings are entire homes, so room type is not a differentiator between host segments. The investor-relevant story is in the booking rate trajectory over time.
+
+Casual hosts running entire-home listings grew their booking rates steadily from 22.9% in 2016 to a peak of 67.3% in 2021, then declined to 46.0% in 2023. Commercial hosts never broke 25% in any year and hovered between 7–25% across the full period - the gap between casual and commercial entire-home performance is structural, not cyclical. Note that 2024 shows near-zero booking rates and inflated prices for all host types; this is a data artifact from a partial-year snapshot, not a real market signal.
+
+The stacked bar confirms casual hosts held ~80% of entire-home supply consistently from 2015–2023. The apparent commercial share spike in 2024 is another partial-year artifact: as casual hosts with incomplete data drop out, commercial listings remain visible, inflating their apparent share.
+
+For an investor: acquiring an entire home in Popincourt does not solve the commercial host problem. The product (entire home) is effectively identical across host types - 91% of casual hosts already run entire homes. The performance gap comes from operating style and price, not from what is being listed.
+
+---
+
+## Analysis 2: Temporal Cohort Analysis - When Did Each Host Type Enter?
+
+The gentrification timeline question: when did commercial hosts start flooding into Popincourt? If the commercialization wave is recent, it may explain the underperformance - new commercial hosts have not established review histories. If it is older, the underperformance reflects a structural market rejection.
+
+```{r}
+# parse host_since into cohort year
+airbnb_popincourt <- airbnb_popincourt %>%
+    mutate(
+        cohort_year = as.integer(format(as.Date(host_since), "%Y"))
+    )
+
+# count of distinct host entries per year by host type
+# use host_id + host_type deduplication so each host counts once at their entry year
+cohort_counts <- airbnb_popincourt %>%
+    filter(!is.na(host_type), !is.na(cohort_year)) %>%
+    distinct(host_id, cohort_year, host_type) %>%
+    count(cohort_year, host_type, name = "new_hosts")
+
+cohort_counts
+```
+
+```{r}
+# stacked bar: new host entries per year, colored by host type
+ggplot(cohort_counts, aes(x = cohort_year, y = new_hosts, fill = host_type)) +
+    geom_col() +
+    scale_fill_manual(values = c(
+        "casual" = "#2196F3",
+        "semi-pro" = "#FF9800",
+        "commercial" = "#F44336"
+    )) +
+    labs(
+        title = "New Host Entries by Year and Host Type",
+        subtitle = "Each host counted once at their host_since year",
+        x = "Year", y = "New Hosts", fill = "Host Type"
+    ) +
+    theme_minimal()
+```
+
+```{r}
+# cumulative share of commercial hosts over time
+cumulative_share <- cohort_counts %>%
+    arrange(cohort_year) %>%
+    group_by(cohort_year) %>%
+    mutate(total_year = sum(new_hosts)) %>%
+    ungroup() %>%
+    group_by(host_type) %>%
+    mutate(cumulative_hosts = cumsum(new_hosts)) %>%
+    ungroup() %>%
+    group_by(cohort_year) %>%
+    mutate(
+        cumulative_total = sum(cumulative_hosts),
+        cumulative_pct = cumulative_hosts / cumulative_total
+    ) %>%
+    ungroup()
+
+ggplot(cumulative_share, aes(x = cohort_year, y = cumulative_pct, fill = host_type)) +
+    geom_area(alpha = 0.85) +
+    scale_fill_manual(values = c(
+        "casual" = "#2196F3",
+        "semi-pro" = "#FF9800",
+        "commercial" = "#F44336"
+    )) +
+    scale_y_continuous(labels = scales::percent_format()) +
+    labs(
+        title = "Cumulative Host Composition Over Time",
+        subtitle = "Share of all hosts to date, by type",
+        x = "Year", y = "Cumulative Share", fill = "Host Type"
+    ) +
+    theme_minimal()
+```
+
+**Findings:**
+
+The gentrification-as-commercial-invasion story is not supported by the entry data. Commercial hosts did not flood into Popincourt in a recent wave - they entered at the same time as casual hosts (2009–2011 origins), and their share of new entries has never dominated any year. New host entry peaked in 2014–2015 (~820 new hosts in 2015) and has declined steadily since, which is itself a signal: the market's growth phase is over.
+
+The cumulative composition chart is the most important output here. By 2012 the market had settled into a stable structure - roughly 70–75% casual, 20% semi-pro, 5–8% commercial - and that composition barely moved for the next decade. There was no commercial takeover wave. The commercial share of cumulative hosts stayed flat below 10% from 2012 through 2024.
+
+One methodological note: `host_type` is classified by current `host_listings_count`, not listings count at join date. A host who entered as a single-listing casual in 2014 but now operates six listings is classified as commercial in the 2014 cohort. This retroactive reclassification likely slightly inflates early commercial entry counts. Even with that bias, commercial hosts never crested 10% of cumulative hosts in any year.
+
+For the investor, this reframes the narrative. Commercial underperformance in Popincourt is not the result of a recent misguided wave of investors that could self-correct. Commercial hosts have always been a small, stable minority in this market, and they have always underperformed. The market has structurally never rewarded the commercial playbook here.
+
+---
+
+## analysis 3: minimum nights regulatory displacement indicator
+
+The Paris 120-night annual cap on primary residence short-term rentals creates a compliance pressure point. Hosts who want to list more than 120 nights frequently set `minimum_nights = 30` to reclassify stays as medium-term rentals, which fall outside short-term regulation. This analysis tests whether commercial hosts disproportionately use this workaround and whether the practice has grown over time - a signal of regulatory friction hardening into a structural feature of commercial hosting in Popincourt.
+
+```{r}
+# create 30-night minimum flag
+airbnb_popincourt <- airbnb_popincourt %>%
+    mutate(min_30_flag = minimum_nights >= 30)
+
+# baseline: % of listings with min_30_flag by host type
+airbnb_popincourt %>%
+    filter(!is.na(host_type)) %>%
+    group_by(host_type) %>%
+    summarise(
+        total = n(),
+        min_30_count = sum(min_30_flag, na.rm = TRUE),
+        pct_min_30 = mean(min_30_flag, na.rm = TRUE)
+    ) %>%
+    arrange(desc(pct_min_30))
+```
+
+```{r}
+# track % min_30_flag by host type and year
+min30_by_year <- airbnb_popincourt %>%
+    filter(!is.na(host_type), !is.na(snapshot_year)) %>%
+    group_by(host_type, snapshot_year) %>%
+    summarise(
+        n = n(),
+        pct_min_30 = mean(min_30_flag, na.rm = TRUE),
+        .groups = "drop"
+    )
+
+min30_by_year
+
+# line chart: % using 30-night minimum over time, by host type
+ggplot(min30_by_year, aes(
+    x = snapshot_year, y = pct_min_30,
+    color = host_type, group = host_type
+)) +
+    geom_line(linewidth = 1.1) +
+    geom_point(size = 2.5) +
+    scale_color_manual(values = c(
+        "casual" = "#2196F3",
+        "semi-pro" = "#FF9800",
+        "commercial" = "#F44336"
+    )) +
+    scale_y_continuous(labels = scales::percent_format()) +
+    labs(
+        title = "Share of Listings with Minimum Nights ≥ 30, by Host Type and Year",
+        subtitle = "Proxy for regulatory displacement from Paris 120-night short-term rental cap",
+        x = "Year", y = "% of Listings with min_nights ≥ 30",
+        color = "Host Type"
+    ) +
+    theme_minimal()
+```
+
+```{r}
+# cross-tab: does the 30-night flag affect booking rate differently by host type?
+airbnb_popincourt %>%
+    filter(!is.na(host_type)) %>%
+    group_by(host_type, min_30_flag) %>%
+    summarise(
+        n = n(),
+        avg_booking_rate = mean(as.integer(high_booking) - 1L, na.rm = TRUE),
+        avg_price = mean(price, na.rm = TRUE),
+        .groups = "drop"
+    ) %>%
+    arrange(host_type, min_30_flag)
+```
+
+**Findings:**
+
+The baseline confirms commercial hosts use the 30-night minimum at nearly 2x the rate of casual hosts (14.3% vs 8.3%), which is consistent with regulatory displacement - commercial operators operating at scale have more exposure to the 120-night cap and more incentive to reclassify listings as medium-term.
+
+The year-over-year chart reveals something more complex. From 2015–2020, commercial hosts ran 7–14% min_30 rates while casual hosts were near zero - that early gap is the regulatory fingerprint. But starting in 2021, all three host types surged dramatically, and casual hosts actually exceeded commercial: casual peaked at 35.1% in 2022 vs. ~26.5% for commercial. This spike is almost certainly pandemic-driven: 2021–2022 was the period of remote-work demand for medium-term stays, and all hosts adapted to that shift. Casual hosts adapted more aggressively than commercial ones.
+
+The cross-tab is the most unexpected finding in the entire analysis:
+
+| Host Type | min_30_flag | Avg Booking Rate | Avg Price |
+|---|---|---|---|
+| Casual | FALSE | 41.9% | $97 |
+| **Casual** | **TRUE** | **69.7%** | **$81** |
+| Semi-pro | FALSE | 26.4% | $112 |
+| Semi-pro | TRUE | 38.5% | $79 |
+| Commercial | FALSE | 12.4% | $148 |
+| Commercial | TRUE | 6.3% | $123 |
+
+Casual hosts with a 30-night minimum book at 69.7% - the highest booking rate of any cell in the dataset - and at the lowest price of any segment ($81). Semi-pro hosts with the flag also outperform their non-flagged counterparts. Commercial hosts go the other direction: the 30-night flag is associated with a booking rate drop from 12.4% to 6.3%.
+
+The interpretation is straightforward: the medium-term rental market is real in Popincourt, and casual hosts are winning it the same way they win short-term - through conservative pricing. A casual host who sets a 30-night minimum and charges $81/night books at a 70% rate. A commercial host who does the same charges $123 and books at 6%. The 30-night minimum is not a regulatory escape hatch that saves commercial operators; it is just another configuration where casual pricing dominance reasserts itself.
+
+For the investor: the minimum_nights feature belongs in the final model, and the interaction between `min_30_flag` and `host_type` is worth testing explicitly. The flag is not directionally bad - in fact it is the single highest-booking configuration in the data - but only for hosts who price it correctly.
+
+---

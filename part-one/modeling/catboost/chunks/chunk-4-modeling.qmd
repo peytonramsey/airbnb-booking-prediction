@@ -1,0 +1,387 @@
+
+```{r pre-select-features}
+# looking into both df's to see what i actually need from them
+glimpse(train_clean)
+glimpse(test_clean)
+```
+
+```{r select-features}
+# select features
+train_clean <- train_clean %>%
+    select(c(
+        # new added features
+        regulatory_category,
+        max_nights_risk_flag,
+        complete_listings,
+        zipcode,
+        is_location_exact,
+        # target variable
+        high_booking,
+        # added features from above
+        host_about_binary,
+        guests_included,
+        bathrooms,
+        bedrooms,
+        beds,
+        extra_people,
+        security_deposit,
+        cleaning_fee,
+        reviews_per_month,
+        # host features
+        host_response_time,
+        host_response_rate,
+        host_is_superhost,
+        # listing features
+        property_type,
+        room_type,
+        accommodates,
+        # pricing features
+        price,
+        # booking policies
+        minimum_nights,
+        maximum_nights,
+        # amenity features
+        amenity_count,
+        # all review features
+        review_scores_rating, 
+        review_scores_accuracy,
+        review_scores_cleanliness,
+        review_scores_checkin,
+        review_scores_communication,
+        review_scores_location,
+        review_scores_value,
+        longitude_cleansed,
+        latitude_cleansed,
+        description_length,
+        amenity_has_wifi, 
+        amenity_has_pool, 
+        amenity_has_parking, 
+        amenity_has_kitchen,
+        has_luxury_keyword, 
+        is_multi_listing_host, 
+        host_experience_proxy,
+        total_cost, 
+        cleaning_fee_ratio
+
+    ))
+
+test_clean <- test_clean %>%
+    select(c(
+        # new added features
+        regulatory_category,
+        max_nights_risk_flag,
+        complete_listings,
+        zipcode, 
+        is_location_exact, 
+        # added features from above 
+        host_about_binary, 
+        guests_included, 
+        bathrooms,
+        bedrooms, 
+        beds, 
+        extra_people, 
+        security_deposit, 
+        cleaning_fee, 
+        reviews_per_month, 
+        # host features 
+        host_response_time, 
+        host_response_rate, 
+        host_is_superhost, 
+        # listing features 
+        property_type, 
+        room_type, 
+        accommodates, 
+        # pricing features 
+        price, 
+        # booking policies 
+        minimum_nights, 
+        maximum_nights,
+        # amenity features
+        amenity_count,
+        # all review features
+        review_scores_rating, 
+        review_scores_accuracy,
+        review_scores_cleanliness,
+        review_scores_checkin,
+        review_scores_communication,
+        review_scores_location,
+        review_scores_value,
+        longitude_cleansed,
+        latitude_cleansed,
+        description_length,
+        amenity_has_wifi, 
+        amenity_has_pool, 
+        amenity_has_parking, 
+        amenity_has_kitchen,
+        has_luxury_keyword, 
+        is_multi_listing_host, 
+        host_experience_proxy,
+        total_cost, 
+        cleaning_fee_ratio
+
+    ))
+
+
+glimpse(train_clean)
+glimpse(test_clean)
+
+colSums(is.na(train_clean))
+colSums(is.na(test_clean))
+```
+
+```{r relabel-target}
+train_clean <- train_clean %>%
+  mutate(high_booking = factor(
+    as.integer(as.character(high_booking)),
+    levels = c(0, 1),
+    labels = c("low", "high")
+  ))
+```
+
+```{r catboost-preprocessing}
+airbnb_recipe <- recipe(high_booking ~ ., data = train_clean) %>%
+  step_lencode_mixed(zipcode, outcome = vars(high_booking)) %>%
+  step_other(property_type, threshold = 0.01) %>%
+  step_unknown(all_nominal_predictors(), -host_response_time) %>%
+  step_novel(all_nominal_predictors())
+
+
+```
+
+```{r catboost-hybrid-tune}
+
+# create validation hold out set
+set.seed(42)
+val_idx    <- sample(nrow(train_clean), size = floor(0.2 * nrow(train_clean)))
+val_data   <- train_clean[val_idx, ]
+train_data <- train_clean[-val_idx, ]
+
+# prep and bake - val must be baked AFTER prep, using train-only recipe
+prepped      <- prep(airbnb_recipe, training = train_data)
+train_baked  <- bake(prepped, new_data = train_data) %>% select(-high_booking)
+train_labels <- as.integer(train_data$high_booking) - 1L  # "low"=0, "high"=1
+
+val_baked  <- bake(prepped, new_data = val_data) %>% select(-high_booking)
+val_labels <- as.integer(val_data$high_booking) - 1L
+
+# CatBoost R detects factor columns automatically from data.frame - no cat_features needed
+train_pool <- catboost.load_pool(
+  data  = as.data.frame(train_baked),
+  label = train_labels
+)
+
+val_pool <- catboost.load_pool(
+  data  = as.data.frame(val_baked),
+  label = val_labels
+)
+
+# scoring function - each call runs 5-fold CV and returns mean AUC
+cv_score <- function(depth, learning_rate, l2_leaf_reg, subsample, min_data_in_leaf, rsm) {
+  params <- list(
+    loss_function      = "Logloss",
+    eval_metric        = "AUC",
+    auto_class_weights = "Balanced",
+    iterations         = 1000,
+    depth              = as.integer(round(depth)),
+    learning_rate      = learning_rate,
+    l2_leaf_reg        = l2_leaf_reg,
+    od_wait            = 50,
+    logging_level      = "Silent",
+    rsm                = rsm,
+    subsample          = subsample,
+    min_data_in_leaf   = as.integer(round(min_data_in_leaf))
+  )
+  cv <- catboost.cv(pool = train_pool, params = params, fold_count = 5)
+  list(Score = max(cv$test.AUC.mean), Pred = 0)
+}
+
+# parameter bounds (lo, hi) for each hyperparameter
+bounds <- list(
+  depth            = c(4,     8),
+  learning_rate    = c(0.005, 0.05),
+  l2_leaf_reg      = c(1,     20),
+  subsample        = c(0.6,   0.95),
+  min_data_in_leaf = c(10,    60),
+  rsm              = c(0.4,   0.9)
+)
+param_names <- names(bounds)
+n_params    <- length(param_names)
+
+# map unit-cube point [0,1]^d → actual parameter values
+scale_params <- function(x_unit) {
+  setNames(
+    mapply(function(v, nm) bounds[[nm]][1] + v * diff(bounds[[nm]]), x_unit, param_names),
+    param_names
+  )
+}
+
+# evaluate cv_score from a unit-cube row vector
+eval_point <- function(x_unit) {
+  p <- scale_params(as.numeric(x_unit))
+  cv_score(
+    depth            = p["depth"],
+    learning_rate    = p["learning_rate"],
+    l2_leaf_reg      = p["l2_leaf_reg"],
+    subsample        = p["subsample"],
+    min_data_in_leaf = p["min_data_in_leaf"],
+    rsm              = p["rsm"]
+  )$Score
+}
+
+# Expected Improvement acquisition function
+expected_improvement <- function(x_new, gp_model, y_best, xi = 0.01) {
+  pred <- predict(gp_model, matrix(as.numeric(x_new), nrow = 1))
+  mu   <- pred$Y_hat
+  sig  <- sqrt(max(pred$MSE, 1e-10))
+  z    <- (mu - y_best - xi) / sig
+  max((mu - y_best - xi) * pnorm(z) + sig * dnorm(z), 0)
+}
+
+# --- Bayesian optimisation loop (GPfit + lhs, no extra packages needed) ---
+n_init <- 10
+n_iter <- 20
+
+set.seed(42)
+X_all <- randomLHS(n_init, n_params)              # Latin Hypercube initial design
+y_all <- apply(X_all, 1, eval_point)
+
+cat(sprintf("Init complete | Best AUC: %.5f\n", max(y_all)))
+
+for (i in seq_len(n_iter)) {
+  gp       <- GP_fit(X_all, y_all)               # fit GP surrogate
+  y_best   <- max(y_all)
+  cands    <- randomLHS(2000, n_params)           # candidate points
+  ei_vals  <- apply(cands, 1, function(x) expected_improvement(x, gp, y_best))
+  x_next   <- cands[which.max(ei_vals), , drop = FALSE]
+  y_next   <- eval_point(x_next)
+  X_all    <- rbind(X_all, x_next)
+  y_all    <- c(y_all, y_next)
+  cat(sprintf("Iter %2d/%d | AUC this iter: %.5f | Best so far: %.5f\n",
+              i, n_iter, y_next, max(y_all)))
+}
+
+best_params <- as.list(scale_params(X_all[which.max(y_all), ]))
+cat("\nBest parameters found:\n")
+print(best_params)
+```
+
+```{r train-final-model}
+final_params <- list(
+  loss_function      = "Logloss",
+  eval_metric        = "AUC",
+  auto_class_weights = "Balanced",
+  iterations         = 2000,
+  depth              = as.integer(round(best_params$depth)),
+  learning_rate      = best_params$learning_rate,
+  l2_leaf_reg        = best_params$l2_leaf_reg,
+  od_wait            = 50,
+  logging_level      = "Silent",
+  rsm                = best_params$rsm,
+  subsample          = best_params$subsample,
+  min_data_in_leaf   = as.integer(round(best_params$min_data_in_leaf))
+)
+
+final_fit <- catboost.train(train_pool, val_pool, params = final_params)
+
+```
+
+```{r feature-importance}
+# feature importance
+importance <- catboost.get_feature_importance(final_fit, train_pool, type = "FeatureImportance")
+
+importance_df <- data.frame(
+  feature    = colnames(train_baked),
+  importance = importance
+) %>%
+  arrange(desc(importance))
+
+# print top features
+print(importance_df, n = Inf)
+
+# plot
+importance_df %>%
+  slice_head(n = Inf) %>%
+  ggplot(aes(x = reorder(feature, importance), y = importance)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "CatBoost Feature Importance (all features)", x = NULL, y = "Importance Score")
+
+shap <- catboost.get_feature_importance(final_fit, train_pool, type = "ShapValues")
+shap_df <- as.data.frame(shap)
+colnames(shap_df) <- c(colnames(train_baked), "bias")
+# mean absolute SHAP per feature (overall importance with direction context)
+shap_importance <- shap_df %>%
+  select(-bias) %>%
+  summarise(across(everything(), ~ mean(abs(.)))) %>%
+  pivot_longer(everything(), names_to = "feature", values_to = "mean_abs_shap") %>%
+  arrange(desc(mean_abs_shap))
+
+print(shap_importance, n = Inf)
+
+shap_df %>%
+  select(-bias) %>%
+  summarise(across(everything(), ~ mean(.))) %>%
+  pivot_longer(everything(), names_to = "feature", values_to = "mean_shap") %>%
+  arrange(desc(abs(mean_shap))) %>%
+  print(n = Inf)
+
+```
+
+
+
+```{r predict-test}
+test_baked <- bake(prepped, new_data = test_clean)
+test_pool <- catboost.load_pool(data = as.data.frame(test_baked))
+
+test_preds <- catboost.predict(final_fit, test_pool, prediction_type = "Probability")
+
+```
+
+```{r auc-score}
+best_params$auc  # best CV AUC across 5 folds
+# NOTE: 'results' is a placeholder - populate with your grid search results object if applicable
+results          # full grid to see all combinations
+```
+
+```{r build-submission}
+# add back unique_id (from original raw data, filtered to test rows)
+test_ids <- as.integer(airbnb_data$unique_id)
+
+submission <- tibble(
+  unique_id    = test_ids,
+  high_booking = test_preds
+)
+
+write_csv(submission, "submission-catboost-v7.csv")
+
+```
+
+```{r vetiver-pin}
+library(bonsai)
+
+train_data <- train_data %>% mutate(high_booking = as.factor(high_booking))
+
+boost_spec <- boost_tree(
+  trees      = 500,
+  tree_depth = best_params$depth,
+  learn_rate = best_params$learning_rate,
+  min_n      = best_params$min_data_in_leaf
+) %>%
+  set_engine("catboost",
+    l2_leaf_reg        = best_params$l2_leaf_reg,
+    subsample          = best_params$subsample,
+    auto_class_weights = "Balanced",
+    logging_level      = "Silent"
+  ) %>%
+  set_mode("classification")
+
+
+wf <- workflow() %>%
+  add_recipe(airbnb_recipe) %>%
+  add_model(boost_spec)
+
+final_fit_wf <- fit(wf, data = train_data)
+
+v <- vetiver_model(final_fit_wf, model_name = "airbnb-catboost-v7")
+
+```

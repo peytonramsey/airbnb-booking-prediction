@@ -1,0 +1,598 @@
+---
+title: "popincourt catboost classifier"
+format: html
+---
+
+# library import
+
+```{python libraries}
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import math
+import polars as pl
+from functools import reduce
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score, classification_report
+import catboost as cb
+from catboost import CatBoostClassifier
+import shap
+```
+
+```{python polars-config}
+pl.Config.set_fmt_str_lengths(900)
+pl.Config.set_tbl_width_chars(900)
+pl.Config(tbl_rows=-1, tbl_cols=-1)
+```
+
+# load and clean data
+
+```{python load-data}
+df_raw = pl.read_csv(
+    "C:/Users/ramse/msba-courses/ds 810/airbnb-project/part-two/data/airbnb-project-paris-sampled-Popincourt.csv",
+    null_values=["", "NA", "N/A", "n/a", "-"],
+    infer_schema_length=0,
+    has_header=True,
+)
+
+print(f"Rows: {df_raw.height}, Cols: {df_raw.width}")
+```
+
+```{python clean-data}
+df = df_raw.with_columns([
+    # target
+    pl.col("high_booking").cast(pl.Int32, strict=False),
+    # price: strip $ and commas
+    pl.col("price").str.replace_all(r"[\$,]", "").cast(pl.Float64),
+    # percent columns
+    pl.col("host_response_rate").str.replace("%", "", literal=True).cast(pl.Float64),
+    pl.col("host_acceptance_rate").str.replace("%", "", literal=True).cast(pl.Float64),
+    # categorical
+    pl.col("room_type").cast(pl.Categorical),
+    pl.col("property_type").cast(pl.Categorical),
+    pl.col("instant_bookable").cast(pl.Categorical),
+    pl.col("cancellation_policy").cast(pl.Categorical),
+    pl.when(pl.col("host_response_time") == "N/A")
+        .then(None)
+        .otherwise(pl.col("host_response_time"))
+        .cast(pl.Categorical),
+    # numeric
+    pl.col("latitude_cleansed").cast(pl.Float64, strict=False),
+    pl.col("longitude_cleansed").cast(pl.Float64, strict=False),
+    pl.col("latitude").cast(pl.Float64, strict=False),
+    pl.col("longitude").cast(pl.Float64, strict=False),
+    pl.col("accommodates").cast(pl.Int32, strict=False),
+    pl.col("bathrooms").cast(pl.Float64, strict=False),
+    pl.col("bedrooms").cast(pl.Float64, strict=False),
+    pl.col("beds").cast(pl.Float64, strict=False),
+    pl.col("minimum_nights").cast(pl.Int32, strict=False),
+    pl.col("maximum_nights").cast(pl.Int32, strict=False),
+    pl.col("reviews_per_month").cast(pl.Float64, strict=False),
+    pl.col("host_listings_count").cast(pl.Int32, strict=False),
+    pl.col("review_scores_rating").cast(pl.Float64, strict=False),
+    pl.col("review_scores_cleanliness").cast(pl.Float64, strict=False),
+    pl.col("review_scores_checkin").cast(pl.Float64, strict=False),
+    pl.col("review_scores_communication").cast(pl.Float64, strict=False),
+    pl.col("review_scores_location").cast(pl.Float64, strict=False),
+    pl.col("review_scores_value").cast(pl.Float64, strict=False),
+    pl.col("security_deposit").str.replace_all(r"[\$,]", "").cast(pl.Float64),
+    pl.col("cleaning_fee").str.replace_all(r"[\$,]", "").cast(pl.Float64),
+    pl.col("extra_people").str.replace_all(r"[\$,]", "").cast(pl.Float64),
+    # date columns for temporal features
+    pl.col("date").cast(pl.Utf8),
+    pl.col("host_since").cast(pl.Utf8),
+])
+
+# amenity_count
+df = df.with_columns([
+    pl.when(pl.col("amenities").is_null())
+        .then(0)
+        .otherwise(pl.col("amenities").str.split(",").list.len())
+        .alias("amenity_count")
+])
+
+# price filter: remove zero-price and p99 outliers
+p99 = df["price"].quantile(0.99)
+df = df.filter((pl.col("price") > 0) & (pl.col("price") <= p99))
+
+print(f"After price filter: {df.height} rows")
+print(f"high_booking positive rate: {df['high_booking'].mean():.3f}")
+```
+
+# feature engineering
+
+```{python regulatory-features}
+pat_commercial = r"(?i)hotel|hostel|bed and breakfast|\bresort\b"
+pat_primary    = r"(?i)apartment|condominium|condo|\bloft\b|serviced|rental unit|residential|entire home|entire place|\bfloor\b"
+
+def add_regulatory_features(df: pl.DataFrame) -> pl.DataFrame:
+    prop = pl.col("property_type").cast(pl.Utf8)
+    room = pl.col("room_type").cast(pl.Utf8)
+    return (
+        df
+        .with_columns([
+            pl.when(
+                (room == "Hotel room") |
+                prop.str.contains(pat_commercial)
+            )
+            .then(pl.lit("commercial_type"))
+            .when(
+                (room == "Entire home/apt") &
+                prop.str.contains(pat_primary)
+            )
+            .then(pl.lit("entire_primary_likely"))
+            .when(room == "Entire home/apt")
+            .then(pl.lit("entire_nonstandard"))
+            .when(room.is_in(["Private room", "Shared room"]))
+            .then(pl.lit("room_rental"))
+            .otherwise(pl.lit("other"))
+            .cast(pl.Categorical)
+            .alias("regulatory_category"),
+        ])
+        .with_columns([
+            (
+                (pl.col("regulatory_category") == "entire_primary_likely") &
+                (pl.col("minimum_nights") >= 30)
+            ).cast(pl.Int32).alias("min_nights_avoidance_flag"),
+        ])
+    )
+
+df = add_regulatory_features(df)
+print(df["regulatory_category"].value_counts(sort=True))
+```
+
+```{python amenities-features}
+_LUXURY_KW   = [r"\bpool\b", r"hot tub", r"jacuzzi", r"sauna", r"\bgym\b", r"fitness center",
+                r"doorman", r"fireplace", r"piano", r"billiard", r"game room", r"concierge"]
+_PRACTICAL_KW = [r"wifi", r"internet", r"wireless", r"kitchen", r"\bwasher\b", r"\bdryer\b",
+                 r"\bheating\b", r"air conditioning", r"refrigerator", r"microwave",
+                 r"dishwasher", r"\biron\b", r"hair dryer", r"coffee maker"]
+
+def _bucket_count(am_expr, keywords: list) -> pl.Expr:
+    flags = [am_expr.str.contains(kw).cast(pl.Int32) for kw in keywords]
+    return reduce(lambda a, b: a + b, flags)
+
+def parse_amenities(df: pl.DataFrame) -> pl.DataFrame:
+    am = pl.col("amenities").fill_null("").str.to_lowercase()
+    return df.with_columns([
+        _bucket_count(am, _LUXURY_KW).alias("amenity_luxury_count"),
+        _bucket_count(am, _PRACTICAL_KW).alias("amenity_practical_count"),
+    ])
+
+df = parse_amenities(df)
+```
+
+```{python popincourt-specific-features}
+# gentrification anchor coordinates
+_OBERKAMPF = (48.8667, 2.3667)
+_BASTILLE  = (48.8533, 2.3692)
+_ROQUETTE  = (48.8567, 2.3790)
+
+def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6_371_000.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+def add_haversine_distances(df: pl.DataFrame) -> pl.DataFrame:
+    lats = df["latitude_cleansed"].to_list()
+    lons = df["longitude_cleansed"].to_list()
+    d_ob  = [_haversine_m(la, lo, *_OBERKAMPF) if la is not None else None for la, lo in zip(lats, lons)]
+    d_bas = [_haversine_m(la, lo, *_BASTILLE)  if la is not None else None for la, lo in zip(lats, lons)]
+    d_roq = [_haversine_m(la, lo, *_ROQUETTE)  if la is not None else None for la, lo in zip(lats, lons)]
+    return df.with_columns([
+        pl.Series("distance_to_oberkampf", d_ob,  dtype=pl.Float64),
+        pl.Series("distance_to_bastille",  d_bas, dtype=pl.Float64),
+        pl.Series("distance_to_roquette",  d_roq, dtype=pl.Float64),
+    ])
+
+def add_host_type(df: pl.DataFrame) -> pl.DataFrame:
+    return df.with_columns([
+        pl.when(pl.col("host_listings_count") == 1)
+            .then(pl.lit("casual"))
+            .when((pl.col("host_listings_count") >= 2) & (pl.col("host_listings_count") <= 5))
+            .then(pl.lit("semi-pro"))
+            .when(pl.col("host_listings_count") > 5)
+            .then(pl.lit("commercial"))
+            .otherwise(None)
+            .cast(pl.Categorical)
+            .alias("host_type"),
+    ])
+
+def add_temporal_features(df: pl.DataFrame) -> pl.DataFrame:
+    return df.with_columns([
+        pl.col("date")
+            .str.slice(0, 4)
+            .cast(pl.Int32, strict=False)
+            .alias("snapshot_year"),
+        pl.col("host_since")
+            .str.slice(0, 4)
+            .cast(pl.Int32, strict=False)
+            .alias("cohort_year"),
+    ])
+
+def add_min30_flag(df: pl.DataFrame) -> pl.DataFrame:
+    return df.with_columns([
+        (pl.col("minimum_nights") >= 30).cast(pl.Int32).alias("min_30_flag"),
+    ])
+
+df = add_haversine_distances(df)
+df = add_host_type(df)
+df = add_temporal_features(df)
+df = add_min30_flag(df)
+
+print(df["host_type"].value_counts(sort=True))
+print(f"min_30_flag rate: {df['min_30_flag'].mean():.3f}")
+```
+
+```{python pricing-features}
+def add_dynamic_pricing(df: pl.DataFrame) -> pl.DataFrame:
+    price = pl.col("price")
+    price_tier = (
+        pl.when(price < 50).then(pl.lit("budget"))
+          .when(price < 100).then(pl.lit("mid"))
+          .when(price < 200).then(pl.lit("premium"))
+          .otherwise(pl.lit("luxury"))
+          .cast(pl.Categorical)
+    )
+    cleaning_fee_ratio = (
+        pl.when(pl.col("cleaning_fee").is_not_null() & (price > 0))
+            .then(pl.col("cleaning_fee") / price)
+            .otherwise(0.0)
+    )
+    return df.with_columns([
+        price_tier.alias("price_tier"),
+        cleaning_fee_ratio.alias("cleaning_fee_ratio"),
+        pl.col("price").log(base=math.e).alias("log_price"),
+        (pl.col("price") / pl.col("bedrooms").fill_null(1).clip(lower_bound=1))
+            .alias("price_per_bedroom"),
+        (pl.col("cleaning_fee").fill_null(0) / pl.col("minimum_nights").clip(lower_bound=1))
+            .alias("cleaning_fee_per_night"),
+        (pl.col("price") + pl.col("cleaning_fee").fill_null(0) + pl.col("security_deposit").fill_null(0))
+            .alias("total_cost"),
+    ])
+
+df = add_dynamic_pricing(df)
+```
+
+```{python host-signals}
+def host_quality(df: pl.DataFrame) -> pl.DataFrame:
+    return df.with_columns([
+        (pl.col("host_listings_count").is_not_null() & (pl.col("host_listings_count") > 1))
+            .cast(pl.Int32).alias("is_multi_listing_host"),
+        pl.when(pl.col("host_about").is_null())
+            .then(0)
+            .otherwise(pl.col("host_about").str.split(" ").list.len())
+            .cast(pl.Float64).alias("host_experience_proxy"),
+    ])
+
+def host_trust_signals(df: pl.DataFrame) -> pl.DataFrame:
+    return df.with_columns([
+        pl.col("host_identity_verified")
+            .cast(pl.Utf8).str.to_lowercase().str.contains("true")
+            .fill_null(False).cast(pl.Int32).alias("host_identity_verified"),
+    ])
+
+def host_verification_signals(df: pl.DataFrame) -> pl.DataFrame:
+    return df.with_columns([
+        pl.col("host_verifications")
+            .str.count_matches(r"'[^']+'")
+            .fill_null(0).cast(pl.Int32).alias("verification_count"),
+    ])
+
+df = host_quality(df)
+df = host_trust_signals(df)
+df = host_verification_signals(df)
+```
+
+```{python imputation}
+# reviews_per_month: 0 for listings with no review history
+df = df.with_columns(pl.col("reviews_per_month").fill_null(0))
+
+# bedrooms: NA = studio = 0
+df = df.with_columns(pl.col("bedrooms").fill_null(0).cast(pl.Int32))
+
+# bathrooms: fill with median
+bath_median = df["bathrooms"].median()
+df = df.with_columns(pl.col("bathrooms").fill_null(bath_median))
+
+# extra_people, security_deposit, cleaning_fee: fill 0
+for col in ["extra_people", "security_deposit", "cleaning_fee"]:
+    df = df.with_columns(pl.col(col).fill_null(0))
+
+# has_reviews flag
+df = df.with_columns(
+    pl.when(pl.col("review_scores_rating").is_null()).then(0).otherwise(1)
+        .cast(pl.Int32).alias("has_reviews")
+)
+
+# host_response_rate
+_COMM_IMPUTE = {0: 90.0, 1: 95.0, 2: 96.0}
+
+review_sub_cols = [
+    "review_scores_cleanliness", "review_scores_checkin",
+    "review_scores_communication", "review_scores_location", "review_scores_value"
+]
+
+def cat_review_expr(col_name: str) -> pl.Expr:
+    return (
+        pl.when((pl.col("has_reviews") == 0) | pl.col(col_name).is_null())
+            .then(0)
+            .when(pl.col(col_name) < 10)
+            .then(1)
+            .otherwise(2)
+            .cast(pl.Int32)
+            .alias(col_name)
+    )
+
+df = df.with_columns([cat_review_expr(c) for c in review_sub_cols])
+
+df = df.with_columns([
+    pl.col("host_response_rate").is_null().cast(pl.Int32).alias("host_response_rate_missing"),
+    pl.when(pl.col("host_response_rate").is_not_null())
+        .then(pl.col("host_response_rate"))
+        .when(pl.col("review_scores_communication") == 0).then(pl.lit(90.0))
+        .when(pl.col("review_scores_communication") == 1).then(pl.lit(95.0))
+        .otherwise(pl.lit(96.0))
+        .alias("host_response_rate"),
+])
+
+df = df.with_columns(
+    pl.when(pl.col("host_response_rate") >= 100).then(pl.lit("perfect"))
+        .when(pl.col("host_response_rate") >= 90).then(pl.lit("near_perfect"))
+        .otherwise(pl.lit("underperforming"))
+        .cast(pl.Categorical).alias("host_response_tier")
+)
+
+# host_acceptance_rate
+_ACC_OTHER_MEAN = 84.3
+df = df.with_columns([
+    pl.col("host_acceptance_rate").is_null().cast(pl.Int32).alias("host_acceptance_rate_missing"),
+    pl.when(pl.col("host_acceptance_rate").is_not_null())
+        .then(pl.col("host_acceptance_rate"))
+        .when(pl.col("instant_bookable").cast(pl.Utf8).str.to_lowercase().str.contains("t"))
+        .then(pl.lit(100.0))
+        .otherwise(pl.lit(_ACC_OTHER_MEAN))
+        .alias("host_acceptance_rate"),
+])
+
+print("Imputation complete")
+print(df.select(["reviews_per_month", "bathrooms", "host_response_rate", "host_acceptance_rate"])
+        .null_count())
+```
+
+# model preparation
+
+```{python select-features}
+tabular_features = [
+    # price signals
+    "log_price", "price_tier", "cleaning_fee_ratio", "price_per_bedroom",
+    "cleaning_fee_per_night", "total_cost",
+    # host identity
+    "host_type", "host_listings_count", "is_multi_listing_host",
+    "host_experience_proxy", "host_identity_verified", "verification_count",
+    "host_response_rate", "host_response_rate_missing", "host_response_tier",
+    "host_acceptance_rate", "host_acceptance_rate_missing",
+    # listing characteristics
+    "room_type", "regulatory_category", "accommodates", "bedrooms", "bathrooms",
+    "amenity_count", "amenity_luxury_count", "amenity_practical_count",
+    # booking policy
+    "instant_bookable", "cancellation_policy", "minimum_nights", "min_30_flag",
+    "min_nights_avoidance_flag",
+    # review signals
+    "reviews_per_month", "review_scores_rating", "review_scores_cleanliness",
+    "review_scores_communication", "review_scores_location", "review_scores_value",
+    "has_reviews",
+    # geography
+    "latitude_cleansed", "longitude_cleansed",
+    "distance_to_oberkampf", "distance_to_bastille", "distance_to_roquette",
+    # temporal
+    "snapshot_year", "cohort_year",
+]
+
+cat_features = [
+    "host_type", "room_type", "regulatory_category", "price_tier",
+    "instant_bookable", "cancellation_policy", "host_response_tier",
+]
+
+df_model = df.select(tabular_features + ["high_booking"]).to_pandas()
+
+# fill categoricals
+for col in cat_features:
+    df_model[col] = df_model[col].astype(object).fillna("Unknown")
+
+# drop rows with null target
+df_model = df_model.dropna(subset=["high_booking"])
+
+y = df_model["high_booking"].astype(int).values
+X = df_model.drop(columns=["high_booking"])
+
+print(f"Feature matrix: {X.shape}")
+print(f"Positive rate: {y.mean():.3f}")
+print("Null counts per feature:")
+print(X.isnull().sum()[X.isnull().sum() > 0])
+```
+
+```{python train-test-split}
+X_train, X_holdout, y_train, y_holdout = train_test_split(
+    X, y, test_size=0.20, random_state=42, stratify=y
+)
+
+print(f"Train: {X_train.shape[0]} | Holdout: {X_holdout.shape[0]}")
+print(f"Train positive rate: {y_train.mean():.3f} | Holdout positive rate: {y_holdout.mean():.3f}")
+```
+
+# model training
+
+```{python catboost-fit}
+best_params = {
+    "learning_rate":    0.02,
+    "depth":            9,
+    "l2_leaf_reg":      35,
+    "subsample":        0.7471,
+    "min_data_in_leaf": 226,
+    "rsm":              0.6177,
+    "random_strength":  0.80,
+}
+
+final_params = {
+    "loss_function":      "Logloss",
+    "eval_metric":        "AUC",
+    "auto_class_weights": "Balanced",
+    "iterations":         2000,
+    "od_wait":            25,
+    "logging_level":      "Verbose",
+    "random_seed":        42,
+    **best_params,
+}
+
+train_pool   = cb.Pool(X_train,   label=y_train,   cat_features=cat_features)
+holdout_pool = cb.Pool(X_holdout, label=y_holdout, cat_features=cat_features)
+
+model = CatBoostClassifier(**final_params)
+model.fit(train_pool, eval_set=holdout_pool, use_best_model=True)
+
+print(f"\nBest iteration: {model.best_iteration_}")
+```
+
+# evaluation
+
+```{python evaluation}
+holdout_proba = model.predict_proba(holdout_pool)[:, 1]
+holdout_pred  = (holdout_proba >= 0.5).astype(int)
+
+auc = roc_auc_score(y_holdout, holdout_proba)
+print(f"Holdout ROC AUC:  {auc:.5f}")
+print(f"US Kaggle AUC:    0.86071  (Part I national baseline)")
+print(f"\nClassification report (threshold = 0.50):")
+print(classification_report(y_holdout, holdout_pred, target_names=["low_booking", "high_booking"]))
+```
+
+```{python threshold-sweep}
+thresholds = np.arange(0.20, 0.80, 0.02)
+results = []
+for t in thresholds:
+    pred_t = (holdout_proba >= t).astype(int)
+    report = classification_report(y_holdout, pred_t, output_dict=True, zero_division=0)
+    results.append({
+        "threshold": round(t, 2),
+        "precision_high": round(report["1"]["precision"], 3),
+        "recall_high":    round(report["1"]["recall"],    3),
+        "f1_high":        round(report["1"]["f1-score"],  3),
+    })
+
+thresh_df = pd.DataFrame(results)
+best_f1_row = thresh_df.loc[thresh_df["f1_high"].idxmax()]
+print(thresh_df.to_string(index=False))
+print(f"\nOptimal threshold (max F1 on high_booking): {best_f1_row['threshold']}")
+```
+
+# SHAP analysis
+
+```{python shap-global}
+shap_vals = model.get_feature_importance(
+    holdout_pool,
+    type="ShapValues"
+)
+shap_matrix = shap_vals[:, :-1]  # drop bias column
+shap_df     = pd.DataFrame(shap_matrix, columns=X_holdout.columns)
+
+# global bar: mean |SHAP| per feature
+shap_importance = shap_df.abs().mean().sort_values(ascending=False)
+shap_direction  = shap_df.mean().reindex(shap_importance.index)
+
+print("=== Global SHAP Importance (mean |SHAP|) ===")
+print(pd.DataFrame({
+    "mean_abs_shap": shap_importance.round(4),
+    "mean_shap_direction": shap_direction.round(4)
+}).to_string())
+
+fig, ax = plt.subplots(figsize=(9, 10))
+shap_importance.head(20).sort_values().plot.barh(ax=ax, color="steelblue")
+ax.set_title("Top 20 Features - Mean |SHAP| (Popincourt Model)")
+ax.set_xlabel("Mean |SHAP value|")
+plt.tight_layout()
+plt.show()
+```
+
+```{python shap-beeswarm}
+# reuse shap_matrix from shap-global - avoids TreeExplainer categorical column issue
+_base_value = float(shap_vals[0, -1])
+
+shap_explanation = shap.Explanation(
+    values=shap_matrix,
+    base_values=np.full(len(shap_matrix), _base_value),
+    data=X_holdout.values,
+    feature_names=X_holdout.columns.tolist(),
+)
+
+shap.plots.beeswarm(shap_explanation, max_display=20, show=True)
+```
+
+```{python shap-individual-profiles}
+_base_value = float(shap_vals[0, -1])
+_feat_names  = X_holdout.columns.tolist()
+
+# best case: casual + budget - use positional index into shap_matrix
+best_pos = np.where(
+    (X_holdout["host_type"].values == "casual") &
+    (X_holdout["price_tier"].values == "budget")
+)[0]
+if len(best_pos) > 0:
+    p = best_pos[np.argmax(holdout_proba[best_pos])]  # highest predicted prob in segment
+    print(f"=== Best Case: Casual + Budget (highest predicted probability in segment) ===")
+    print(f"Predicted probability: {holdout_proba[p]:.3f}")
+    print(f"Actual label: {y_holdout[p]}")
+    shap.plots.waterfall(shap.Explanation(
+        values=shap_matrix[p],
+        base_values=_base_value,
+        data=X_holdout.iloc[p].values,
+        feature_names=_feat_names,
+    ), max_display=15, show=True)
+
+# worst case: commercial + premium
+worst_pos = np.where(
+    (X_holdout["host_type"].values == "commercial") &
+    (X_holdout["price_tier"].values == "premium")
+)[0]
+if len(worst_pos) > 0:
+    p = worst_pos[np.argmin(holdout_proba[worst_pos])]  # lowest predicted prob in segment
+    print(f"\n=== Worst Case: Commercial + Premium (lowest predicted probability in segment) ===")
+    print(f"Predicted probability: {holdout_proba[p]:.3f}")
+    print(f"Actual label: {y_holdout[p]}")
+    shap.plots.waterfall(shap.Explanation(
+        values=shap_matrix[p],
+        base_values=_base_value,
+        data=X_holdout.iloc[p].values,
+        feature_names=_feat_names,
+    ), max_display=15, show=True)
+```
+
+# comparison: Popincourt vs US national model
+
+```{python model-comparison}
+print("=" * 55)
+print("Model Comparison")
+print("=" * 55)
+print(f"US National CatBoost (Kaggle AUC):  0.86071")
+print(f"Popincourt CatBoost (holdout AUC):  {auc:.5f}")
+print()
+print("Top 10 features by SHAP (Popincourt):")
+for i, (feat, val) in enumerate(shap_importance.head(10).items(), 1):
+    direction = "↑" if shap_direction[feat] > 0 else "↓"
+    print(f"  {i:2}. {feat:<35} {val:.4f}  {direction}")
+print()
+print("Key interpretation:")
+print("  - host_response_rate_missing (#1) and snapshot_year (#2) are data-structure artifacts,")
+print("    not investor-actionable signals. Missing response rate proxies new/inactive listings;")
+print("    snapshot_year captures the multi-year panel structure including the 2024 partial-year drop.")
+print("  - reviews_per_month (#3) and log_price (#5) are the top investor-actionable features.")
+print("  - host_type (#11) carries independent signal above and beyond price - confirms EDA finding")
+print("    that commercial underperformance is not fully explained by pricing behavior alone.")
+print("  - distance_to_* features rank 19–27: geography picks up weak signal but is not a lever.")
+print("  - min_30_flag is near-zero (#42): regulatory mechanism not independently predictive")
+print("    after reviews_per_month and minimum_nights are already in the model.")
+```

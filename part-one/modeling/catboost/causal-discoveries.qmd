@@ -1,0 +1,166 @@
+# causal discoveries made from python-catboost.qmd
+
+```{r}
+library(pcalg)
+library(tpc)
+library(dplyr)
+library(tidyr)
+library(bnlearn)
+library(tidyverse)
+library(tidymodels)
+library(fixest)
+library(grf)
+```
+
+```{r causal-discovery-plot}
+# step 1, load data
+causal_df <- read.csv("train_clean_for_r.csv")
+colnames(causal_df)
+
+# step 2, create causal_df selecting features to test causality for
+causal_df <- causal_df %>%
+    mutate(
+        high_booking       = as.numeric(high_booking),
+        host_is_superhost  = as.numeric(host_is_superhost == "t"),
+        host_response_rate = as.numeric(host_response_rate)
+    ) %>%
+    select(
+        high_booking,
+        price_vs_neighbourhood_median,
+        cleaning_fee_per_night,
+        host_response_rate,
+        host_is_superhost,
+        review_scores_rating,
+        amenity_count,
+        description_length,
+        minimum_nights,
+        accommodates
+    ) %>%
+    drop_na()
+
+# step 4, creating skeleton
+suffStat <- list(C = cor(causal_df), n = nrow(causal_df))
+varNames <- colnames(causal_df)
+skel.causal_df <- skeleton(suffStat, indepTest = gaussCItest, labels = varNames, alpha = 0.01)
+mygraph <- function(pcgraph) {
+    g <- bnlearn::as.bn(pcgraph, check.cycles = FALSE)
+    par(bg = "white")
+    bnlearn::graphviz.plot(g, shape = "ellipse")
+}
+mygraph(skel.causal_df)
+
+# PC-algorithm
+start_time <- Sys.time()
+pc.causal_df <- pc(suffStat, indepTest = gaussCItest, labels = varNames, alpha = 0.01)
+end_time <- Sys.time()
+end_time - start_time
+mygraph(pc.causal_df)
+
+# TPC - tiers encode temporal/causal ordering; must cover all 10 columns
+# tier 1: host/listing structure set before any guest interaction
+# tier 2: host quality signals (partially shaped by experience over time)
+# tier 3: listing quality signals visible to guests
+# tier 4: outcome
+tiers <- c(
+    accommodates = 1,
+    minimum_nights = 1,
+    price_vs_neighbourhood_median = 1,
+    cleaning_fee_per_night = 2,
+    host_is_superhost = 2,
+    host_response_rate = 2,
+    amenity_count = 3,
+    description_length = 3,
+    review_scores_rating = 3,
+    high_booking = 4
+)
+tpc.fit <- tpc(
+    suffStat  = list(C = cor(causal_df), n = nrow(causal_df)),
+    indepTest = gaussCItest,
+    alpha     = 0.01,
+    labels    = colnames(causal_df),
+    tiers     = tiers
+)
+mygraph(tpc.fit)
+```
+
+
+## tpc plot
+
+![alt text](image.png)
+
+### findings
+
+1. host_is_superhost is causally peripheral - isolated in the graph with almost no connections. its effect on booking is mediated through host_response_rate and review scores, not direct.
+
+2. pricing is a central hub - price_vs_neighbourhood_median and cleaning_fee_per_night are upstream of many other variables. relative pricing influences both host behavior and perceived listing quality.
+
+3. listing quality chain: review_scores_rating → amenity_count → description_length → accommodates. higher-quality listings tend to be larger and more thoroughly described. these variables share signal, so you don't need all of them.
+
+4. high_booking connects directly to most variables. every variable except host_is_superhost has a direct structural link to the outcome.
+
+**keep**: price_vs_neighbourhood_median, cleaning_fee_per_night, host_response_rate, review_scores_rating, amenity_count, minimum_nights, accommodates, description_length
+
+**deprioritize**: host_is_superhost - redundant signal already captured by host_response_rate and review_scores_rating
+
+### feature selection notes
+
+the TPC graph on a representative subset confirms the causal logic behind the feature categories (pricing signals → booking, host quality → booking). the full model extends within these same categories.
+
+**remove - causal leakage risk:**
+
+*reviews_per_month* - downstream of high_booking (more bookings → more reviews). including it risks the model learning the effect, not the cause.
+
+**remove - peripheral in causal graph:**
+
+*host_is_superhost* - no direct causal path to high_booking; signal captured by host_response_rate and review_scores_rating.
+
+**redundant pairs - keep one:**
+
+- cleaning_fee vs cleaning_fee_per_night: keep cleaning_fee_per_night (normalized)
+- review_scores_rating vs review_scores_value: keep review_scores_rating
+- host_response_time vs host_response_rate: keep host_response_rate (continuous)
+- beds vs accommodates: keep accommodates
+- host_experience_proxy vs listing_id_proxy: likely correlated, check before keeping both
+
+**consolidate overlapping trust signals:**
+
+verification_count, has_reviews_verification, host_identity_verified - verification_count likely subsumes the binary flags.
+
+**text length signals - diminishing returns:**
+
+description_length and name_length are the most distinct; summary_length and neighborhood_overview_length add marginal signal.
+
+
+## part 2: ATE and ITE treatment effects
+
+```{r}
+df <- read_csv("train_clean_for_r.csv")
+
+dfbnb <- df %>%
+    mutate(
+        month = floor_date(date, unit = "month"),
+        treatment = as.integer(
+            date >= as.Date("2019-11-01")
+        )
+    )
+
+# quick clean
+dfbnb_cf <- dfbnb %>%
+    mutate(
+        host_response_time = as.numeric(factor(host_response_time)),
+        room_type = as.numeric(factor(room_type)),
+        instant_bookable = as.numeric(instant_bookable == "t"),
+        host_response_rate = as.numeric(gsub("%", "", host_response_rate)) / 100,
+        host_acceptance_rate = as.numeric(gsub("%", "", host_acceptance_rate)) / 100
+    ) %>%
+    drop_na(
+        host_response_time, host_response_rate, maximum_nights,
+        minimum_nights, longitude_cleansed, latitude_cleansed,
+        accommodates, room_type, host_acceptance_rate,
+        review_scores_rating, instant_bookable,
+        reviews_per_month, treatment
+    )
+
+ate <- average_treatment_effect(cf, target.sample = "overlap")
+print(ate)
+```

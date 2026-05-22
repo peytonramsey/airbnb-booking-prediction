@@ -1,0 +1,292 @@
+---
+title: "eda: popincourt spatial patterns"
+format: html
+---
+
+```{r library-setup}
+#| include: false
+library(tidyverse)
+library(tidymodels)
+library(plumber)
+library(tidytable)
+library(geosphere)
+library(ggplot2)
+library(sf)
+library(rnaturalearth)
+library(ggforce)
+library(osmdata)
+library(maptiles)
+library(ggnewscale)
+```
+
+## phase 1: setup & first look
+
+```{r load-data}
+#| include: false
+# load data with tidytable
+airbnb_popincourt <- fread("C:/Users/ramse/msba-courses/ds 810/airbnb-project/part-two/data/airbnb-project-paris-sampled-Popincourt.csv")
+
+# clean data
+airbnb_popincourt <- airbnb_popincourt %>%
+  mutate(
+    price = as.numeric(gsub("[$,]", "", price)),
+    amenity_count = lengths(strsplit(as.character(amenities), ",")),
+    high_booking = as.factor(high_booking)
+  )
+
+# check data types
+glimpse(airbnb_popincourt)
+
+# check dimensions
+dim(airbnb_popincourt)
+
+# check na values per column
+colSums(is.na(airbnb_popincourt))
+
+```
+
+## data visualization to explore statial patterns
+
+```{r map-plot}
+#| eval: true
+#| echo: false
+# plot listings on a map
+ggplot(airbnb_popincourt, aes(x = longitude, y = latitude, color = high_booking)) +
+  geom_point(alpha = 0.5) +
+  theme_minimal()
+```
+
+```{r density-maps}
+#| layout-ncol: 2
+#| fig-height: 10
+#| fig-width: 10
+#| echo: false
+#| eval: true
+
+# hexbin map: avg high_booking rate per hex (0 = low, 1 = high)
+airbnb_popincourt %>%
+  mutate(high_booking_num = as.numeric(as.character(high_booking))) %>%
+  ggplot(aes(x = longitude, y = latitude, z = high_booking_num)) +
+  stat_summary_hex(bins = 30, fun = mean) +
+  scale_fill_viridis_c(option = "B", name = "Avg High Booking Rate") +
+  labs(
+    title = "High Booking Rate Across Popincourt",
+    x = "Longitude", y = "Latitude"
+  ) +
+  theme_minimal()
+
+# hexbin map: avg price per hex
+airbnb_popincourt %>%
+  ggplot(aes(x = longitude, y = latitude, z = price)) +
+  stat_summary_hex(bins = 30, fun = mean) +
+  scale_fill_viridis_c(option = "B", name = "Avg Price (EUR)") +
+  labs(
+    title = "Average Listing Price Across Popincourt",
+    x = "Longitude", y = "Latitude"
+  ) +
+  theme_minimal()
+
+```
+
+```{r density-dual-overlay}
+#| echo: false
+#| eval: true
+
+# z-score price and high_booking at listing level, then flag alignment per listing
+df_aligned <- airbnb_popincourt %>%
+  mutate(
+    high_booking_num = as.numeric(as.character(high_booking)),
+    price_z   = as.numeric(scale(price)),
+    booking_z = as.numeric(scale(high_booking_num)),
+    aligned   = as.numeric(abs(price_z - booking_z) < 1)
+  )
+
+# stat_summary_hex averages the per-listing alignment flag per hex bin
+# fill = proportion of listings in each hex where price and booking rate are within 1 SD
+ggplot(df_aligned, aes(x = longitude, y = latitude, z = aligned)) +
+  stat_summary_hex(bins = 30, fun = mean) +
+  scale_fill_gradient(
+    low = "#2D1B69", high = "#FFB347",
+    name = "Prop. Aligned\n(price ~ booking)"
+  ) +
+  labs(
+    title = "Price-Booking Alignment Across Popincourt",
+    subtitle = "Bright hexes: listings where price rank and booking rate rank move together (within 1 SD)",
+    x = "Longitude", y = "Latitude"
+  ) +
+  theme_minimal()
+```
+
+```{r dual-overlay-v2}
+#| echo: false
+#| eval: true
+
+# rebuild both hex summaries at the hex level (same bins = 30)
+p_booking <- airbnb_popincourt %>%
+  mutate(high_booking_num = as.numeric(as.character(high_booking))) %>%
+  ggplot(aes(x = longitude, y = latitude, z = high_booking_num)) +
+  stat_summary_hex(bins = 30, fun = mean)
+
+p_price <- airbnb_popincourt %>%
+  ggplot(aes(x = longitude, y = latitude, z = price)) +
+  stat_summary_hex(bins = 30, fun = mean)
+
+hex_booking <- ggplot_build(p_booking)$data[[1]] %>%
+  transmute(x, y, booking_rate = value)
+
+hex_price <- ggplot_build(p_price)$data[[1]] %>%
+  transmute(x, y, avg_price = value)
+
+# flag hexes where BOTH are in the top quartile (bright/yellow in both plots)
+hex_combined <- inner_join(hex_booking, hex_price, by = c("x", "y")) %>%
+  mutate(
+    both_high = booking_rate >= quantile(booking_rate, 0.75, na.rm = TRUE) &
+                avg_price    >= quantile(avg_price,    0.75, na.rm = TRUE)
+  )
+
+ggplot(hex_combined, aes(x = x, y = y, z = as.numeric(both_high))) +
+  stat_summary_hex(bins = 30, fun = mean) +
+  scale_fill_gradient(
+    low = "#2D1B69", high = "#FFB347",
+    name = "Overlap Score"
+  ) +
+  labs(
+    title = "High Price & High Booking Rate Overlap",
+    subtitle = "Bright hexes: top quartile in both avg price AND avg high-booking rate",
+    x = "Longitude", y = "Latitude"
+  ) +
+  theme_minimal()
+```
+
+```{r dual-overlay-v3}
+#| echo: false
+#| eval: true
+library(osmdata)
+
+# 1. get bounding box for Popincourt
+bb <- getbb("Popincourt, Paris, France")
+
+# 2. pull the neighborhood boundary
+boundary <- opq(bb) %>%
+  add_osm_feature(key = "boundary", value = "administrative") %>%
+  osmdata_sf()
+
+# 3. pull the street network
+streets <- opq(bb) %>%
+  add_osm_feature(key = "highway") %>%
+  osmdata_sf()
+
+# compute both_high at listing level so stat_summary_hex bins from raw coordinates
+df_both_high <- airbnb_popincourt %>%
+  mutate(
+    high_booking_num = as.numeric(as.character(high_booking)),
+    both_high = as.numeric(
+      price >= quantile(price, 0.75, na.rm = TRUE) & high_booking_num == 1
+    )
+  )
+
+options(scipen = 999)
+
+ggplot() +
+  geom_sf(data = streets$osm_lines, color = "grey50", linewidth = 0.2, inherit.aes = FALSE) +
+  stat_summary_hex(
+    data = df_both_high,
+    aes(x = longitude, y = latitude, z = both_high),
+    bins = 30, fun = mean, alpha = 0.75
+  ) +
+  geom_sf(data = boundary$osm_multipolygons, fill = NA, color = "white", linewidth = 0.9, inherit.aes = FALSE) +
+  scale_fill_gradient(
+    low = "#2D1B69", high = "#FFB347",
+    name = "Overlap Score"
+  ) +
+  coord_sf(
+    xlim = range(airbnb_popincourt$longitude) + c(-0.002, 0.002),
+    ylim = range(airbnb_popincourt$latitude)  + c(-0.002, 0.002)
+  ) +
+  labs(
+    title = "High Price & High Booking Rate Overlap",
+    subtitle = "Bright hexes: top quartile in both avg price AND avg high-booking rate",
+    x = "Longitude", y = "Latitude"
+  ) +
+  theme_minimal() +
+  theme(panel.background = element_rect(fill = "#1a1a2e", color = NA))
+
+
+```
+
+## GOLDEN MAP BELOW: dual density overlay with satellite background showing top quartile in both avg price AND avg high-booking rate
+
+use this map below in the report/presentation to show the spatial eda we performed which highlights (the yellow hexes) the areas with high price and high booking rate.
+
+why use this map:
+
+- shows the spatial distribution of high price and high booking rate
+  - important to understand where the high-value listings are located
+  - helps identify areas that may be experiencing gentrification
+  
+
+```{r dual-overlay-v4}
+#| echo: false
+#| eval: true
+
+library(maptiles)
+library(ggnewscale)
+
+options(scipen = 999)
+
+# bounding box from listing extent
+bbox_sf <- st_bbox(
+  c(xmin = min(airbnb_popincourt$longitude) - 0.002,
+    xmax = max(airbnb_popincourt$longitude) + 0.002,
+    ymin = min(airbnb_popincourt$latitude)  - 0.002,
+    ymax = max(airbnb_popincourt$latitude)  + 0.002),
+  crs = st_crs(4326)
+)
+
+# fetch Esri satellite tiles (no API key required)
+satellite_tiles <- get_tiles(bbox_sf, provider = "Esri.WorldImagery", zoom = 15)
+
+# pull Popincourt boundary from OSM
+boundary <- opq(as.numeric(bbox_sf)) %>%
+  add_osm_feature(key = "boundary", value = "administrative") %>%
+  osmdata_sf()
+
+# listing-level both_high flag
+df_both_high <- airbnb_popincourt %>%
+  mutate(
+    high_booking_num = as.numeric(as.character(high_booking)),
+    both_high = as.numeric(
+      price >= quantile(price, 0.75, na.rm = TRUE) & high_booking_num == 1
+    )
+  )
+
+# convert satellite SpatRaster to data frame for ggplot2 (no tidyterra needed)
+tile_df <- as.data.frame(satellite_tiles, xy = TRUE)
+names(tile_df)[3:5] <- c("r", "g", "b")
+tile_df$color <- rgb(tile_df$r / 255, tile_df$g / 255, tile_df$b / 255)
+
+ggplot() +
+  geom_raster(data = tile_df, aes(x = x, y = y, fill = color)) +
+  scale_fill_identity() +
+  new_scale_fill() +
+  stat_summary_hex(
+    data = df_both_high,
+    aes(x = longitude, y = latitude, z = both_high),
+    bins = 30, fun = mean, alpha = 0.75
+  ) +
+  geom_sf(data = boundary$osm_multipolygons, fill = NA, color = "white", linewidth = 0.9, inherit.aes = FALSE) +
+  scale_fill_gradient(
+    low = "#2D1B69", high = "#FFB347",
+    name = "Overlap Score"
+  ) +
+  coord_sf(
+    xlim = c(bbox_sf["xmin"], bbox_sf["xmax"]),
+    ylim = c(bbox_sf["ymin"], bbox_sf["ymax"])
+  ) +
+  labs(
+    title = "High Price & High Booking Rate Overlap",
+    subtitle = "Bright hexes: top quartile in both avg price AND avg high-booking rate",
+    x = "Longitude", y = "Latitude"
+  ) +
+  theme_minimal()
+```

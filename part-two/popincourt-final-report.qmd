@@ -1,0 +1,322 @@
+---
+title: "Gentrification and the Airbnb Investor: A Data Analysis of Popincourt, Paris"
+author: "Peyton Ramsey"
+date: "May 2026"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    theme: cosmo
+---
+
+## executive summary
+
+This analysis examines 93,578 Airbnb listing-months in Popincourt, Paris's 11th Arrondissement, to answer a practical question for an investor: does the conventional professional Airbnb strategy work here? The answer is no. Commercial hosts - those operating six or more listings - charge an average of \$144 per night and achieve an 11.5% booking rate. Casual hosts charge \$96 and book at 44.2%. The worst single segment in the dataset is commercial hosts in the premium price tier, at 9.5% booking. The best is casual hosts in the budget tier, at 59.1% - a ratio of more than 6x. A Popincourt-specific CatBoost classifier trained on this data achieved a holdout AUC of 0.966, confirming that booking outcomes in this neighborhood are highly predictable from listing characteristics, and that the signals favoring casual budget operation are robust to model-level controls. The data-supported strategy for a new entrant is to price conservatively and operate with a resident-style approach. The commercial playbook produces the worst outcomes in this market.
+
+---
+
+## central question and gentrification context
+
+**Central question:** Is the gentrification of Popincourt causing a shift in the way Airbnb investors should approach this market, and if so, what does the data say to do instead?
+
+Popincourt is one of Paris's most actively gentrifying neighborhoods. The area surrounding Rue Oberkampf, once known for working-class cafes and independent venues, has undergone sustained transformation over the past decade as higher-income residents, boutique businesses, and short-term rental investors have moved in. The conventional assumption in most major Airbnb markets is that professional operators capture disproportionate revenue: in Los Angeles, commercial hosts capture 65.8% of estimated revenue. In Popincourt, casual hosts capture 62.5% despite representing 77.7% of the market.
+
+The Paris municipal government imposes a 120-night annual cap on short-term rentals of primary residences. Commercial operators attempting to circumvent this constraint frequently set `minimum_nights = 30` to reclassify stays as medium-term rentals outside short-term regulation, or set `maximum_nights` to Airbnb's default of 365 or 1,125. These patterns are visible in the data and inform both the feature engineering and the regulatory analysis below.
+
+Three sub-questions structure the analysis:
+
+| # | Question | Finding |
+|---|---|---|
+| Q1 | Is price the primary lever controlling booking success? | Yes. 32pp gap: budget 54.3% vs. premium 22.1%. log_price is the strongest logistic predictor (coeff −1.126, p<0.001). |
+| Q2 | Does host type independently explain booking performance, or is it a proxy for pricing behavior? | Both. 6x booking gap (casual 44.2% vs. commercial 11.5%). Price partially confounds but host_type carries independent SHAP signal (#11 globally after all price features are controlled). |
+| Q3 | Does geography within Popincourt create exploitable micro-market advantages? | No. k-means at k=3 and k=4: only 4pp variation across clusters. Correlation 0.018. Geography is not the lever. |
+
+---
+
+## dataset and methodology
+
+### data
+
+- **93,578** listing-month observations; **95** columns; source: Inside Airbnb (Popincourt, `neighbourhood_cleansed == 'Popincourt'`)
+- Target variable: `high_booking` (binary, 41.5% positive rate; 38,800 of 93,578 observations)
+- Working set after removing zero-price entries and above-p99 outliers (p99 = \$520/night): approximately **86,871 rows**
+- Temporal coverage: **2015–2024** snapshot dates (`date` column); host entry data from **2008 onward** (`host_since`)
+
+### feature engineering
+
+In addition to the standard feature set carried over from the US national model, the following Popincourt-specific features were constructed:
+
+- **`host_type`** - classified from `host_listings_count`: casual (1 listing), semi-pro (2–5), commercial (6+)
+- **`distance_to_oberkampf`, `distance_to_bastille`, `distance_to_roquette`** - Haversine distances in meters to three gentrification anchor coordinates, to test whether proximity to cultural poles adds geographic signal
+- **`min_30_flag`** - binary: `minimum_nights ≥ 30`, a proxy for regulatory reclassification from short-term to medium-term rental
+- **`snapshot_year`, `cohort_year`** - year extracted from `date` and `host_since` respectively, for temporal analyses
+
+### model
+
+Primary model: **CatBoost classifier**, matching the framework used in Part I. Rationale: native categorical handling, ordered target statistics to prevent encoding leakage, strong out-of-box performance on mixed tabular data. The Popincourt model uses an 80/20 stratified train/holdout split rather than a Kaggle-style cross-validation loop, with SHAP analysis as the primary interpretability output. Text SVD features from Part I were excluded - the goal here is investor interpretation, not AUC maximization.
+
+---
+
+## eda findings
+
+### price and booking rate {#sec-price}
+
+Price is the single strongest predictor of booking outcome. The distribution is right-skewed (median \$80, mean \$111.50 before outlier removal); log transformation is applied for modeling.
+
+| Price Tier | Avg Price/Night | Avg Booking Rate | N Listings |
+|---|---|---|---|
+| Budget (bottom third) | \$48.60 | 54.3% | 26,266 |
+| Mid (middle third) | \$78.90 | 43.4% | 29,091 |
+| Premium (top third) | \$167.00 | 22.1% | 31,514 |
+
+The 32-percentage-point spread is clean, monotonic, and statistically robust. The logistic regression coefficient on `log_price` is −1.126 (p < 0.001), making it the strongest predictor in the baseline specification. In a gentrifying neighborhood where premium listings are multiplying, the budget listings are winning the actual bookings.
+
+> **Plain English:** In most markets, charging more means earning more. In Popincourt, charging more means booking less. A host priced at \$167/night on average books at less than half the rate of one priced at \$49.
+
+### host type analysis {#sec-hosttype}
+
+Hosts were classified using `host_listings_count`: casual (1 listing), semi-pro (2–5), commercial (6+).
+
+| Host Segment | % of Market | Avg Booking Rate | Avg Price/Night | % of Total Revenue* |
+|---|---|---|---|---|
+| Casual | 77.7% | 44.2% | \$96 | 62.5% |
+| Semi-pro | 14.9% | 27.2% | \$110 | 18.7% |
+| Commercial | 7.5% | 11.5% | \$144 | 15.1% |
+
+\* Revenue proxy = price × reviews_per_month. Directional estimate; relative ordering is stable given the magnitude of differences.
+
+Commercial hosts charge 50% more than casual hosts but book at less than one-quarter the rate. Despite representing 7.5% of the market, they capture only 15.1% of estimated revenue - the opposite of markets like Los Angeles where commercial operators dominate.
+
+**Cross-tabulation by host type and price tier:**
+
+| Host Type | Price Tier | N | Avg Booking Rate |
+|---|---|---|---|
+| Casual | Budget | 20,889 | 59.1% |
+| Casual | Mid | 22,654 | 47.9% |
+| Casual | Premium | 21,162 | 25.5% |
+| Semi-pro | Budget | 3,791 | 39.4% |
+| Semi-pro | Mid | 3,435 | 28.6% |
+| Semi-pro | Premium | 5,158 | 17.3% |
+| Commercial | Budget | 798 | 13.0% |
+| Commercial | Mid | 1,580 | 15.6% |
+| Commercial | Premium | 3,836 | 9.5% |
+
+The commercial + premium combination achieves a 9.5% booking rate - the single worst cell. Casual + budget achieves 59.1% - a 6x ratio. Critically, commercial hosts underperform casual hosts at **every** comparable price tier. A commercial host cannot recover their position in this market by adjusting price alone. This is why host type is expected to carry independent predictive value in the model even after controlling for pricing.
+
+### geographic analysis {#sec-geography}
+
+K-means clustering on latitude/longitude was run at k=3 and k=4. The correlation between cluster assignment and `high_booking` is **0.018** - effectively zero. Only 4 percentage points of variation in booking rate were observed across spatial clusters at either k value.
+
+Hexbin maps of average price and average booking rate across the neighborhood confirm that both signals are widely distributed rather than geographically concentrated. Listings that achieve both top-quartile price and top-quartile booking rate simultaneously are sparse and scattered - not clustered in a way that would support a geographic acquisition strategy.
+
+Gentrification anchor distances (Oberkampf, Bastille, Roquette) were computed via Haversine formula and included as model features. SHAP analysis later confirms these distances produce weak but non-zero signal (ranks 19–27 globally), consistent with the EDA verdict: geography is not a meaningful lever.
+
+> **Verdict:** An investor cannot target a specific sub-neighborhood of Popincourt and expect structurally higher conversion. The leverage is in pricing and operating style, not location within the neighborhood.
+
+### entire home conversion rate by host type and year {#sec-entirehome}
+
+A common assumption in Airbnb investment analysis is that entire-home listings offer a structural advantage. This analysis tests whether that advantage holds in Popincourt and whether commercial hosts are gaining ground through entire-home acquisition.
+
+**Entire home share by host type:**
+
+| Host Type | Total Listings | Entire Home | % Entire Home |
+|---|---|---|---|
+| Casual | 64,705 | 59,226 | 91.5% |
+| Commercial | 6,214 | 5,628 | 90.6% |
+| Semi-pro | 12,384 | 8,779 | 70.9% |
+
+Room type is not a differentiator between casual and commercial hosts - both operate at ~91% entire-home rates. The investor cannot gain an edge over casual hosts by choosing entire-home properties; casual hosts are already there.
+
+The booking rate trajectory tells the real story. Casual hosts running entire-home listings grew from 22.9% booking rate in 2016 to a peak of 67.3% in 2021, then declined to 46.0% in 2023. Commercial hosts never broke 25% in any year. The gap is structural, not cyclical - it persists across the entire dataset period regardless of price trends or broader market conditions.
+
+*Note: 2024 data shows near-zero booking rates and inflated prices for all host types. This is a partial-year snapshot artifact, not a real market signal, and is excluded from trend interpretation.*
+
+> **Investor conclusion:** Acquiring an entire home in Popincourt does not solve the commercial host problem. The product is effectively identical across host types. The performance gap comes from operating style and price.
+
+### temporal cohort: when did each host type enter? {#sec-cohort}
+
+The gentrification timeline question: was commercial underperformance caused by a recent wave of investors who haven't yet established themselves, or is it structural?
+
+New host entry peaked in **2014–2015** (~820 new hosts in 2015) and has declined steadily since. This is itself a signal: Popincourt's Airbnb market growth phase ended nearly a decade ago.
+
+More importantly, commercial hosts did **not** flood in during a recent wave. They entered the market at the same time as casual hosts - origins in 2009–2011 - and have always represented a small minority. By 2012, the market had settled into a stable composition that barely moved for the next decade:
+
+- **~75% casual / ~20% semi-pro / ~5–8% commercial** (cumulative share, 2012–2024)
+
+There was no commercial takeover. The commercial share of cumulative hosts stayed flat below 10% from 2012 through 2024.
+
+*Methodology note: `host_type` is classified by current `host_listings_count`, not the count at join date. A host who entered in 2014 with one listing but now operates six would appear as "commercial" in the 2014 cohort. This retroactive reclassification slightly inflates early commercial entry counts; the structural conclusion is unchanged.*
+
+> **Investor conclusion:** Commercial underperformance in Popincourt is not a recent, correctable trend. Commercial operators have been present for 15 years and have never found a way to win. This is structural market rejection.
+
+### minimum nights as regulatory displacement indicator {#sec-minnights}
+
+The Paris 120-night annual cap on primary residence short-term rentals creates compliance pressure for operators who list frequently. Hosts who want to circumvent this cap often set `minimum_nights = 30` to reclassify stays as medium-term rentals, which fall outside short-term regulation. This analysis tests whether commercial hosts disproportionately use this workaround, and whether it helps them.
+
+**Baseline: share of listings with minimum_nights ≥ 30 by host type:**
+
+| Host Type | Total | Min 30+ Count | % Min 30+ |
+|---|---|---|---|
+| Commercial | 6,214 | 891 | **14.3%** |
+| Casual | 64,705 | 5,373 | 8.3% |
+| Semi-pro | 12,384 | 749 | 6.0% |
+
+Commercial hosts use the 30-night minimum at nearly 2x the rate of casual hosts. The gap from 2015–2020 - when commercial hosts ran 7–14% min_30 rates while casual hosts were near zero - is the regulatory fingerprint: commercial operators at scale were already repositioning before the rest of the market.
+
+Starting in 2021, all three host types surged simultaneously, with casual hosts actually exceeding commercial (casual peaked at 35.1% in 2022 vs ~26.5% for commercial). This spike is pandemic-driven: 2021–2022 saw a surge in remote-work demand for medium-term stays, and all hosts adapted. Casual hosts adapted more aggressively.
+
+**The key finding is the booking rate cross-tab:**
+
+| Host Type | min_30_flag | Avg Booking Rate | Avg Price |
+|---|---|---|---|
+| Casual | FALSE | 41.9% | \$97 |
+| **Casual** | **TRUE** | **69.7%** | **\$81** |
+| Semi-pro | FALSE | 26.4% | \$112 |
+| Semi-pro | TRUE | 38.5% | \$79 |
+| Commercial | FALSE | 12.4% | \$148 |
+| Commercial | TRUE | 6.3% | \$123 |
+
+Casual hosts with a 30-night minimum book at **69.7%** - the highest booking rate of any cell in the entire dataset - at an average price of \$81. Commercial hosts with the same minimum_nights setting book at **6.3%** at \$123. The workaround does not rescue commercial operators. A casual host who sets a 30-night minimum and prices conservatively wins the medium-term market the same way they win the short-term market. A commercial host who does the same - at higher prices - reaches the worst booking rate in the dataset.
+
+> **Investor conclusion:** The 30-night minimum is not a regulatory escape hatch for commercial operators. It is just another configuration where casual pricing discipline dominates. The model later confirms that `minimum_nights` as a continuous variable carries meaningful SHAP weight (#10), while the binary `min_30_flag` is absorbed and contributes near-zero independent signal (#42).
+
+---
+
+## popincourt catboost model
+
+### model overview {#sec-modeloverview}
+
+A CatBoost binary classifier was trained on 80% of the Popincourt dataset (stratified split) and evaluated on a 20% holdout. The feature set includes all key variables from the EDA - price signals, host characteristics, booking policy, review scores, geographic distances, and the Popincourt-specific features - but excludes text SVD components (which were used in Part I for Kaggle AUC maximization) to keep the model interpretable.
+
+| Metric | Value |
+|---|---|
+| Holdout ROC AUC | **0.96631** |
+| US National Kaggle AUC (Part I) | 0.86071 |
+| Accuracy (threshold = 0.50) | 0.91 |
+| Precision - high_booking | 0.88 |
+| Recall - high_booking | 0.88 |
+| F1 - high_booking | 0.88 |
+| Optimal threshold (max F1) | 0.54 |
+| Precision at 0.54 | 0.893 |
+| Recall at 0.54 | 0.870 |
+| F1 at 0.54 | 0.882 |
+
+The 0.966 AUC reflects two things: the stronger within-neighborhood signal (a single-neighborhood model faces a simpler generalization task than a national one), and the genuinely cleaner, more consistent patterns in Popincourt data. The signals documented in the EDA - price dominance, host type structure, booking policy effects - are strong enough that the model predicts with high confidence across most of the holdout. This is the right framing for the gap vs. the US baseline: Popincourt's booking behavior is more predictable than the US average, which itself is evidence that the market dynamics here are structural and consistent.
+
+### feature importance (shap) {#sec-shap}
+
+SHAP values were computed on the holdout set using CatBoost's native ShapValues implementation. The table below reports mean absolute SHAP (importance magnitude) and categorizes each feature by investor relevance.
+
+| Rank | Feature | Mean \|SHAP\| | Investor-Actionable? |
+|---|---|---|---|
+| 1 | host_response_rate_missing | 0.953 | No - data artifact |
+| 2 | snapshot_year | 0.700 | No - temporal artifact |
+| 3 | reviews_per_month | 0.361 | **Yes** |
+| 4 | price_per_bedroom | 0.314 | **Yes** |
+| 5 | log_price | 0.256 | **Yes** |
+| 6 | cohort_year | 0.239 | Partial |
+| 7 | amenity_count | 0.179 | **Yes** |
+| 8 | host_acceptance_rate_missing | 0.157 | No - data artifact |
+| 9 | total_cost | 0.151 | **Yes** |
+| 10 | minimum_nights | 0.134 | **Yes** |
+| 11 | host_type | 0.110 | **Yes - key for Q2** |
+| 12 | longitude_cleansed | 0.090 | Weak |
+| 19 | distance_to_bastille | 0.064 | Weak |
+| 24 | distance_to_oberkampf | 0.054 | Weak |
+| 27 | distance_to_roquette | 0.050 | Weak |
+| 42 | min_30_flag | 0.006 | No - absorbed by minimum_nights |
+
+**On the top two features:** `host_response_rate_missing` (#1) and `snapshot_year` (#2) are data-structure artifacts, not investor signals. `host_response_rate_missing = 1` flags listings where no response rate was recorded - these are disproportionately older established casual listings with no early tracking, and the flag is highly correlated with their high booking performance. `snapshot_year` encodes the multi-year panel structure of the dataset, including the 2020–2021 peak and the 2024 partial-year near-zero rates. Neither variable is causal. The investor-relevant ranking begins at #3.
+
+**On `log_price` direction:** The mean SHAP direction for `log_price` is effectively zero (+0.006), because the effect is bidirectional - low prices receive large positive SHAP values and high prices receive negative ones. The EDA coefficient of −1.126 is the correct directional interpretation. The SHAP magnitude (0.256) confirms log_price is the fifth-most important driver of prediction confidence.
+
+**On `host_type` (#11):** This is the model-level answer to Q2. After controlling for four price-related features (`price_per_bedroom`, `log_price`, `total_cost`, `price_tier`) and booking activity signals (`reviews_per_month`, `minimum_nights`), `host_type` still contributes independent SHAP signal (0.110). The commercial host underperformance is **not** fully explained by the fact that commercial hosts charge more. Operating style carries information beyond price.
+
+**On geography:** All three gentrification anchor distances appear in the model (ranks 19, 24, 27), confirming they add a small but non-zero signal. This is consistent with the EDA finding: geography is not a lever, but it is not completely irrelevant either. The signal is too weak to support a location-based acquisition strategy.
+
+**On `min_30_flag` (#42):** After `minimum_nights` is already in the model as a continuous variable, the binary 30-night flag contributes almost nothing additional. The regulatory mechanism is captured by `minimum_nights` itself. The EDA cross-tab result (casual 30-night = 69.7% booking) remains valid, but it operates through the continuous minimum_nights signal rather than requiring a separate flag in the model.
+
+### individual listing profiles {#sec-profiles}
+
+To ground the SHAP analysis in concrete investor terms, two representative listings from the holdout set were selected: the highest-probability casual+budget listing and the lowest-probability commercial+premium listing.
+
+**Best case - Casual host, budget tier (predicted probability: 99.8%, actual: high_booking)**
+
+This listing's key characteristics:
+- `log_price = 3.61` → ~\$37/night; `price_per_bedroom = 37`; `price_tier = budget`
+- `minimum_nights = 1` (fully accessible); `cancellation_policy = flexible`
+- `cohort_year = 2014` (established host); `host_type = casual`
+- `distance_to_bastille = 836m`
+
+The SHAP waterfall shows every major feature pushing in the same direction. From the model's base rate of −0.482 (log-odds), `price_per_bedroom` alone contributes +0.63, `price_tier = budget` adds +0.22, `minimum_nights = 1` adds +0.25, and `host_type = casual` adds +0.13. The final log-odds score of +6.1 corresponds to a 99.8% predicted probability. This is what the optimal listing profile looks like in Popincourt: conservatively priced, accessible, flexible, operated by an established casual host.
+
+**Worst case - Commercial host, premium tier (predicted probability: 0.3%, actual: low_booking)**
+
+This listing's key characteristics:
+- `log_price = 4.89` → ~\$133/night; `price_per_bedroom = 133`; `price_tier = premium`
+- `minimum_nights = 30` (regulatory repositioning); `snapshot_year = 2024`
+- `host_listings_count = 23` (heavily commercial); `host_type = commercial`
+- `amenity_count = 48` (over-amenitized)
+
+*Note:* The single largest SHAP driver for this listing is `snapshot_year = 2024` (−1.32), a data artifact from the partial-year snapshot. Setting that aside, the structural factors stack decisively: `minimum_nights = 30` (−0.81), high `price_per_bedroom` (−0.34), `amenity_count = 48` (−0.47 - the model penalizes heavy commercial over-amenitization), `host_listings_count = 23` (−0.16), and `host_type = commercial` (−0.16). Even without the 2024 artifact, this listing's combination of commercial scale, premium pricing, and 30-night minimum produces a predicted probability well below 10%.
+
+### threshold calibration {#sec-threshold}
+
+For the investor binary recommendation (acquire or do not acquire), the optimal decision threshold is **0.54**, which maximizes F1 on the high_booking class:
+
+| Threshold | Precision | Recall | F1 |
+|---|---|---|---|
+| 0.50 | 0.879 | 0.882 | 0.880 |
+| **0.54** | **0.893** | **0.870** | **0.882** |
+| 0.60 | 0.913 | 0.849 | 0.880 |
+
+At threshold 0.54, the model correctly identifies 87% of high-booking listings while flagging only 11% as high-booking that are not (false positive rate on the positive class). For an investor who wants to minimize acquisitions that fail to book, thresholds above 0.54 trade recall for precision; the F1-optimal point at 0.54 balances both.
+
+---
+
+## investor recommendations
+
+### a. pricing strategy
+
+The EDA and model consistently support a **budget-to-mid price position** as the conversion-friendly entry range for Popincourt. Budget listings (avg \$48.60) achieve 54.3% booking; mid-tier (avg \$78.90) achieves 43.4%. Premium (\$167 avg) drops to 22.1%. The decline is monotonic and statistically robust across every host type and every analytical cut.
+
+Revenue maximization and booking rate maximization are not the same objective. A listing at \$79/night that books 43% of nights can generate more monthly revenue than one at \$167 that books 22%, depending on fixed costs. The precise crossover requires a full revenue-per-available-night calculation for a specific property. What the data clearly establishes is that **conservative pricing is the lower-risk entry strategy** and premium pricing carries a steep, well-documented booking cost in this market.
+
+### b. operating style
+
+The data consistently favors a **resident-style, low-volume approach** over a commercial one. Casual hosts achieve 44.2% average booking at \$96 and capture 62.5% of total estimated revenue. Commercial hosts achieve 11.5% at \$144 and capture 15.1% of revenue.
+
+In practical terms, this means: fewer listings operated more attentively, with genuine responsiveness and individual guest communication. `reviews_per_month` is the third-strongest investor-actionable SHAP predictor - booking frequency drives the model's confidence in high-booking status, and it is both a cause and a consequence of the responsive, engaged operating style that casual hosts deliver more consistently.
+
+The `host_type` feature carrying independent SHAP signal (#11, 0.110) after price controls is the model-level confirmation: operating like a commercial host is predictively different from operating like a casual host, above and beyond what pricing explains.
+
+### c. property selection
+
+Geography does not differentiate booking outcomes within Popincourt. Spatial clustering at k=3 and k=4 produced only 4 percentage points of variation in booking rate across zones, and the correlation between cluster assignment and `high_booking` is 0.018. The three gentrification anchor distances contribute weak SHAP values (ranks 19–27). **An investor should not pay a location premium within the neighborhood** based on the assumption that a specific sub-zone offers structurally higher conversion.
+
+Entire-home listings are also not a differentiator - 91.5% of casual host listings are already entire homes. The investor who acquires an entire-home apartment to gain an edge over casual operators will find that casual operators are already running the same product, at lower prices, with better booking outcomes.
+
+Property selection should be driven by **the characteristics that improve pricing position**: room capacity relative to listing price, amenity profile appropriate to the price tier (the model penalizes amenity over-investment at commercial scale), and property type classifications that land in favorable regulatory categories.
+
+### d. what to avoid
+
+The clearest losing combination in this dataset is **commercial host classification paired with premium pricing**. The 9.5% booking rate for commercial + premium is the worst single segment in the data, and the model's worst-case waterfall profile shows that this combination produces a predicted probability of 0.3% - essentially no model-assigned chance of booking success.
+
+**The 30-night minimum is not a viable commercial alternative.** Commercial hosts who set `minimum_nights ≥ 30` drop from an already-low 12.4% booking rate to 6.3%. The medium-term rental market is real in Popincourt, but casual hosts win it for the same reason they win short-term: conservative pricing at \$81/night books at 70%. A commercial host at \$123 for the same minimum stays falls to the worst booking rate in the dataset.
+
+**The commercial scale model does not recover with more listings.** The temporal cohort analysis shows commercial hosts have been present since 2009–2011 and have never achieved competitive booking rates. This is 15 years of data. There is no path to commercial operator success in this market that the data has not already failed to reveal.
+
+---
+
+## methodology notes
+
+**Superhost data:** The `host_is_superhost` variable resolves to 0 across all cleaned observations in this dataset. This appears to be a data coverage issue - the flag was affected during data processing or predates superhost certification for these listings. The feature was excluded from the model. No claims about superhost performance are made in this report.
+
+**2024 partial-year artifact:** The `date` column spans 2015–2024. The 2024 snapshot captures listings mid-year, producing near-zero reviews and inflated prices for all host types. This artifact is the primary driver of `snapshot_year` being the second-largest SHAP feature. For investor conclusions, data from 2023 and earlier is used for trend interpretation. The 2024 data point is flagged wherever it appears.
+
+**`snapshot_year` and `host_response_rate_missing` as model features:** Both rank as the top two SHAP features globally, but neither is investor-actionable. `snapshot_year` encodes the temporal structure of the panel data including COVID disruption (2020–2021 peak) and the 2024 artifact. `host_response_rate_missing` flags listings where no response rate was recorded, which correlates with high-performing older casual listings. These features improve prediction accuracy but should not be interpreted as causal mechanisms. The investor-relevant feature ranking begins at #3 (`reviews_per_month`).
+
+**`host_type` retroactive reclassification:** Host type is classified by current `host_listings_count`, not the count at time of joining Airbnb. A host who joined in 2014 with one listing but now operates six appears as "commercial" in the 2014 cohort in the temporal analysis. This retroactive bias slightly inflates early commercial entry counts in Section 4.5, but does not change the structural conclusion - commercial hosts have always been a stable minority below 10% of cumulative hosts.
+
+**Revenue proxy:** The revenue concentration estimates (casual 62.5%, commercial 15.1%) use `price × reviews_per_month` as a proxy. Because `reviews_per_month` counts reviews rather than actual bookings, these figures are directional estimates. The relative ordering across segments is robust given the magnitude of the differences, but the exact percentages are not precise revenue measurements.

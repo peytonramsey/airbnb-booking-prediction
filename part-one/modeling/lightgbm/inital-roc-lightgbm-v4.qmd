@@ -1,0 +1,480 @@
+
+
+```{r library-setup}
+#| output: false
+# libraries
+library(tidyverse)
+library(tidymodels)
+library(vetiver)
+library(plumber)
+library(tidytable)
+library(bonsai)
+library(lightgbm)
+library(pins)
+library(beepr)
+library(GPfit)
+library(lhs)
+library(dials)
+library(caret)
+library(parallel)
+library(vip)
+
+# set seed
+set.seed(21)
+```
+
+```{r load-test-data}
+# load data using 'tidytable'
+airbnb_data <- fread("C:\\Users\\ramse\\msba-courses\\ds 810\\data\\airbnb-project-msba-kaggle-test.csv")
+glimpse(airbnb_data)
+```
+
+```{r clean-test-data}
+# select relevant columns
+test_clean <- airbnb_data %>%
+    select(c(
+        unique_id, host_id, host_location, host_response_time, host_response_rate, host_is_superhost, latitude, longitude, property_type, room_type, accommodates, bathrooms, bedrooms, beds, bed_type, square_feet, price, weekly_price, monthly_price, guests_included, extra_people, minimum_nights, maximum_nights, review_scores_rating, review_scores_accuracy, review_scores_cleanliness, review_scores_checkin, review_scores_communication, review_scores_location, review_scores_value, reviews_per_month, host_listings_count, host_total_listings_count, amenities, security_deposit, cleaning_fee, instant_bookable, minimum_minimum_nights, maximum_minimum_nights, minimum_maximum_nights, maximum_maximum_nights, minimum_nights_avg_ntm, maximum_nights_avg_ntm, latitude_cleansed, longitude_cleansed
+    ))
+
+glimpse(test_clean)
+
+# check na values
+colSums(is.na(test_clean))
+
+# check dimensions
+nrow(test_clean)
+ncol(test_clean)
+
+# clean test data
+test_clean <- test_clean %>% 
+    mutate(
+        unique_id = as.numeric(unique_id),
+        host_response_time = as.factor(ifelse(host_response_time == "N/A", NA, as.character(host_response_time))),
+        host_response_rate = as.numeric(gsub("%", "", host_response_rate)),
+        host_is_superhost = as.factor(host_is_superhost),
+        property_type = as.factor(property_type),
+        room_type = as.factor(room_type),
+        bed_type = as.factor(bed_type),
+        weekly_price = as.numeric(gsub("[$,]", "", weekly_price)),
+        monthly_price = as.numeric(gsub("[$,]", "", monthly_price)),
+        extra_people = as.numeric(gsub("[$,]", "", extra_people)),
+        security_deposit = as.numeric(gsub("[$,]", "", security_deposit)),
+        cleaning_fee = as.numeric(gsub("[$,]", "", cleaning_fee)),
+        instant_bookable = as.factor(instant_bookable),
+        price = as.numeric(gsub("[$,]", "", price)),
+        price_per_person = price / pmax(accommodates,
+        amenity_count = ifelse(is.na(amenities), 0, lengths(strsplit(as.character(amenities), ","))),
+        reviews_x_rating = reviews_per_month * review_scores_rating,
+        price_x_bedrooms = price / (bedrooms + 1),
+        )
+
+glimpse(test_clean)
+```
+
+```{r load-train-data}
+# load train data
+train_data <- fread("C:\\Users\\ramse\\msba-courses\\ds 810\\data\\airbnb-project-msba-kaggle-train.csv")
+```
+
+```{r clean-train-data}
+# apply same cleaning pipeline as test set
+train_clean <- train_data %>%
+    select(c(
+        high_booking, host_id, host_location, host_response_time, host_response_rate, host_is_superhost, latitude, longitude, property_type, room_type, accommodates, bathrooms, bedrooms, beds, bed_type, square_feet, price, weekly_price, monthly_price, guests_included, extra_people, minimum_nights, maximum_nights, review_scores_rating, review_scores_accuracy, review_scores_cleanliness, review_scores_checkin, review_scores_communication, review_scores_location, review_scores_value, reviews_per_month, host_listings_count, host_total_listings_count, amenities, security_deposit, cleaning_fee, instant_bookable, minimum_minimum_nights, maximum_minimum_nights, minimum_maximum_nights, maximum_maximum_nights, minimum_nights_avg_ntm, maximum_nights_avg_ntm, latitude_cleansed, longitude_cleansed
+    ))
+
+train_clean <- train_clean %>% 
+    mutate(
+        high_booking = as.factor(high_booking),
+        host_response_time = as.factor(ifelse(host_response_time == "N/A", NA, as.character(host_response_time))),
+        host_response_rate = as.numeric(gsub("%", "", host_response_rate)),
+        host_is_superhost = as.factor(host_is_superhost),
+        property_type = as.factor(property_type),
+        room_type = as.factor(room_type),
+        bed_type = as.factor(bed_type),
+        weekly_price = as.numeric(gsub("[$,]", "", weekly_price)),
+        monthly_price = as.numeric(gsub("[$,]", "", monthly_price)),
+        extra_people = as.numeric(gsub("[$,]", "", extra_people)),
+        security_deposit = as.numeric(gsub("[$,]", "", security_deposit)),
+        cleaning_fee = as.numeric(gsub("[$,]", "", cleaning_fee)),
+        instant_bookable = as.factor(instant_bookable),
+        price = as.numeric(gsub("[$,]", "", price)),
+        price_per_person = price / pmax(accommodates, 1),
+        amenity_count = ifelse(is.na(amenities), 0, lengths(strsplit(as.character(amenities), ","))),
+        reviews_x_rating = reviews_per_month * review_scores_rating,
+        price_x_bedrooms = price / pmax(bedrooms, 1),
+        )
+
+glimpse(train_clean)
+nrow(train_clean)
+ncol(train_clean)
+```
+
+```{r check-na-distribution}
+# check na's for all columns in train and test
+colSums(is.na(train_clean))
+colSums(is.na(test_clean))
+```
+
+```{r select-features}
+# select features
+test_clean <- test_clean %>% 
+    select(c(
+        # host features
+        host_response_time,
+        host_response_rate,
+        host_is_superhost,
+        host_listings_count,
+        host_total_listings_count,
+        # listing features
+        property_type,
+        room_type,
+        accommodates,
+        bathrooms,
+        bedrooms,
+        beds,
+        bed_type,
+        latitude_cleansed,
+        longitude_cleansed,
+        # pricing features
+        price,
+        price_per_person,
+        price_x_bedrooms,
+        extra_people,
+        # booking policies
+        guests_included,
+        minimum_nights,
+        maximum_nights,
+        instant_bookable,
+        # review features
+        review_scores_rating,
+        review_scores_accuracy,
+        review_scores_cleanliness,
+        review_scores_checkin,
+        review_scores_communication,
+        review_scores_location,
+        review_scores_value,
+        reviews_per_month,
+        reviews_x_rating,
+        # amenity features
+        amenity_count
+    ))
+
+train_clean <- train_clean %>% 
+    select(c(
+        # target
+        high_booking,
+        # host features
+        host_response_time,
+        host_response_rate,
+        host_is_superhost,
+        host_listings_count,
+        host_total_listings_count,
+        # listing features
+        property_type,
+        room_type,
+        accommodates,
+        bathrooms,
+        bedrooms,
+        beds,
+        bed_type,
+        latitude_cleansed,
+        longitude_cleansed,
+        # pricing features
+        price,
+        price_per_person,
+        price_x_bedrooms,
+        extra_people,
+        # booking policies
+        guests_included,
+        minimum_nights,
+        maximum_nights,
+        instant_bookable,
+        # review features
+        review_scores_rating,
+        review_scores_accuracy,
+        review_scores_cleanliness,
+        review_scores_checkin,
+        review_scores_communication,
+        review_scores_location,
+        review_scores_value,
+        reviews_per_month,
+        reviews_x_rating,
+        # amenity features
+        amenity_count
+    ))
+
+glimpse(train_clean)
+glimpse(test_clean)
+
+```
+
+```{r split-data}
+# split train data into 50% train and 50% validation (stratified on target)
+set.seed(21)
+split <- initial_split(train_clean, prop = 0.5, strata = high_booking)
+train_split <- training(split)
+val_split <- testing(split)
+
+# check dimensions
+nrow(train_split)
+nrow(val_split)
+```
+
+```{r}
+names(airbnb_data)
+```
+
+```{r lightgbm-recipe}
+# lightgbm recipe
+airbnb_recipe <- recipe(high_booking ~ ., data = train_split) %>%
+    # flag listings with no reviews before imputing scores
+    step_mutate(has_reviews = as.factor(ifelse(is.na(reviews_per_month), 0, 1))) %>%
+    # Impute first (on original character/nominal columns before encoding)
+    step_impute_median(all_numeric_predictors()) %>%
+    step_impute_mode(all_nominal_predictors()) %>%
+    step_zv(all_predictors()) %>% 
+    # Log-transform skewed numerics (offset = 1 to handle zeros)
+    step_log(price, minimum_nights, maximum_nights, reviews_per_month,
+        host_listings_count,
+        price_per_person, amenity_count,
+        offset = 1
+    ) %>%
+    # Keep factors as-is - bonsai passes them to LightGBM as native categoricals
+    step_novel(all_nominal_predictors()) %>%
+    step_other(property_type, threshold = 0.005)
+```
+
+
+```{r lightgbm-class-imbalance}
+# compute class imbalance ratio for scale_pos_weight
+tbl <- table(train_clean$high_booking)
+pos_weight <- as.numeric(tbl["0"] / tbl["1"])
+pos_weight
+```
+
+
+```{r lightgbm-model-spec}
+# lightgbm model spec
+lightgbm_spec <- boost_tree(
+    trees = 1500,
+    tree_depth = tune(),
+    learn_rate = 0.03,
+    min_n = tune(),
+    sample_size = tune(),
+    stop_iter = 50
+) %>%
+    set_engine("lightgbm",
+        num_leaves       = tune(),
+        feature_fraction = tune(),
+        counts           = FALSE,
+        scale_pos_weight = pos_weight,
+        validation       = 0.1,
+        lambda_l1        = tune(),
+        lambda_l2        = tune(),
+        num_threads      = parallel::detectCores()
+    ) %>%
+    set_mode("classification")
+
+# workflow
+lightgbm_wf <- workflow() %>%
+    add_recipe(airbnb_recipe) %>%
+    add_model(lightgbm_spec)
+
+lightgbm_wf
+```
+
+```{r lightgbm-define-params}
+# define ranges for engine-level tune() parameters
+lgb_params <- extract_parameter_set_dials(lightgbm_wf) %>%
+    update(
+        tree_depth = dials::tree_depth(range = c(3L, 5L)),
+        num_leaves = dials::new_quant_param(
+            type      = "integer",
+            range     = c(15L, 35L),
+            inclusive = c(TRUE, TRUE),
+            label     = c(num_leaves = "# Leaves")
+        ),
+        feature_fraction = dials::new_quant_param(
+            type      = "double",
+            range     = c(0.5, 0.75),    # force column diversity, prevent near-1
+            inclusive = c(TRUE, TRUE),
+            label     = c(feature_fraction = "Feature Fraction")
+        ),
+        sample_size = dials::sample_prop(range = c(0.6, 0.85)),  # cap row subsampling
+        lambda_l1 = dials::new_quant_param(
+            type      = "double",
+            range     = c(-1, 2),        # log10 scale: 10^-1=0.1 to 10^2=100
+            inclusive = c(TRUE, TRUE),
+            trans     = scales::log10_trans(),
+            label     = c(lambda_l1 = "L1 Penalty")
+        ),
+        lambda_l2 = dials::new_quant_param(
+            type      = "double",
+            range     = c(-1, 2),        # log10 scale: 10^-1=0.1 to 10^2=100
+            inclusive = c(TRUE, TRUE),
+            trans     = scales::log10_trans(),
+            label     = c(lambda_l2 = "L2 Penalty")
+        )
+    )
+```
+
+```{r lightgbm-cv-folds}
+# cross-validation folds on train_split (stratified to handle class imbalance)
+set.seed(21)
+cv_folds <- vfold_cv(train_split, v = 5, strata = high_booking)
+```
+
+```{r lightgbm-tune-hyperparameters}
+# tune hyperparameters - optimizing for ROC AUC
+tune_results <- tune_bayes(
+    lightgbm_wf,
+    resamples = cv_folds,
+    param_info = lgb_params,
+    initial = 10,
+    iter = 25,
+    metrics = metric_set(roc_auc),
+    control = control_bayes(verbose = TRUE, no_improve = 12)
+)
+
+# show best results
+show_best(tune_results, metric = "roc_auc")
+
+beep(2)
+```
+
+```{r}
+# 1. Finalize and fit on train_split only
+best_params <- select_best(tune_results, metric = "roc_auc")
+final_wf <- finalize_workflow(lightgbm_wf, best_params)
+final_fit <- fit(final_wf, data = train_split)
+
+beep(3)
+```
+
+```{r}
+# show all 8 best parameters
+best_params
+
+# print as markdown table
+best_params %>% 
+  as.data.frame() %>% 
+  knitr::kable()
+
+# distribution of new vs reviewed listings in train vs test
+mean(is.na(train_clean$review_scores_rating))
+mean(is.na(test_clean$review_scores_rating))
+```
+
+```{r}
+# 2. Validate locally on true holdout
+val_preds <- predict(final_fit, val_split, type = "prob") %>%
+    bind_cols(val_split %>% select(high_booking))
+roc_auc(val_preds, truth = high_booking, .pred_1, event_level = "second")
+```
+
+```{r}
+# 2b. Refit on full training data for submission (maximizes Kaggle score)
+final_fit_full <- fit(final_wf, data = train_clean)
+beep(2)
+```
+
+```{r}
+# vip
+lgb_model <- extract_fit_engine(final_fit_full)
+lightgbm::lgb.importance(lgb_model, percentage = TRUE) %>% 
+    arrange(desc(Gain)) %>%
+    print(n = 41)
+
+
+# does the distribution differ between train and test?
+table(train_clean$host_response_time) / nrow(train_clean)
+table(test_clean$host_response_time) / nrow(test_clean)
+
+```
+
+```{r}
+# 3. Predict on test set - no high_booking column here
+test_preds <- predict(final_fit_full, test_clean, type = "prob")
+```
+
+```{r}
+# 4. Build submission
+submission <- bind_cols(
+    airbnb_data %>% select(unique_id),
+    test_preds %>% select(.pred_1)
+) %>% rename(high_booking = .pred_1)
+
+write_csv(submission, "submission.csv")
+```
+
+```{r}
+# 5. Version the model with vetiver
+
+v <- vetiver_model(final_fit_full, model_name = "airbnb-lightgbm-v4")
+
+board <- board_folder("models", versioned = TRUE)
+vetiver_pin_write(board, v)
+```
+
+```{r}
+library(patchwork)
+
+combined <- bind_rows(
+    train_clean %>% mutate(split = "train"),
+    test_clean  %>% mutate(split = "test")
+)
+
+# numeric features (by gain order)
+num_features <- c(
+    "reviews_per_month", "host_listings_count", "amenity_count",
+    "latitude_cleansed", "maximum_nights", "host_total_listings_count",
+    "longitude_cleansed", "host_response_rate", "price", "price_per_person",
+    "minimum_nights", "price_x_bedrooms", "extra_people", "reviews_x_rating",
+    "accommodates", "review_scores_value", "review_scores_rating",
+    "review_scores_location", "beds", "guests_included",
+    "review_scores_accuracy", "review_scores_checkin",
+    "review_scores_cleanliness", "bedrooms", "bathrooms",
+    "review_scores_communication"
+)
+
+# categorical features
+cat_features <- c(
+    "property_type", "host_response_time", "host_is_superhost",
+    "room_type", "instant_bookable", "bed_type"
+)
+
+# numeric summary: mean and median for train vs test
+num_summary <- map_dfr(num_features, function(f) {
+    tibble(
+        feature  = f,
+        train_mean   = mean(train_clean[[f]], na.rm = TRUE),
+        test_mean    = mean(test_clean[[f]],  na.rm = TRUE),
+        train_median = median(train_clean[[f]], na.rm = TRUE),
+        test_median  = median(test_clean[[f]],  na.rm = TRUE),
+        mean_pct_diff = abs(train_mean - test_mean) / (abs(train_mean) + 1e-6) * 100
+    )
+}) %>% arrange(desc(mean_pct_diff))
+
+print(num_summary, n = 30, width = Inf)
+
+# categorical summary: proportion of most common level
+cat_summary <- map_dfr(cat_features, function(f) {
+    tr <- table(train_clean[[f]]) / sum(!is.na(train_clean[[f]]))
+    te <- table(test_clean[[f]])  / sum(!is.na(test_clean[[f]]))
+    all_levels <- union(names(tr), names(te))
+    tibble(
+        feature = f,
+        level   = all_levels,
+        train_prop = as.numeric(tr[all_levels]),
+        test_prop  = as.numeric(te[all_levels])
+    ) %>% mutate(
+        train_prop = replace_na(train_prop, 0),
+        test_prop  = replace_na(test_prop, 0),
+        abs_diff   = abs(train_prop - test_prop)
+    )
+}) %>% arrange(desc(abs_diff))
+
+print(cat_summary, n = Inf, width = Inf)
+
+```

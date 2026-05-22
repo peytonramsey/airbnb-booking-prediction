@@ -1,0 +1,425 @@
+
+**Features to add/tidbits to know:**
+
+- complete_listings: listings where all features are listed, requires no na's or zero's
+- this is for Paris market: 
+  - recent_5_star_reviews: recent 5-star reviews to boost visibility
+- missing values such as missing bedrooms, are handled by assuming studios or median values
+- host_response_rate should use median for na's
+- text analysis of description only:
+  - length of description -> find out if longer descriptions yielded in a higher booking rate
+  - topic modeling -> find if certain topics are significant in high_booking
+- remove outliers????
+- availability?
+- avg length of an airbnb on the market
+- lets add in these:
+  - 'zipcode' -> less distinct values than neighbourhood_cleansed
+  - 'is_location_exact' boolean, related to hosts choice for displaying the listings location
+
+- 'minimum_nights' and 'maximum_nights' prelim analysis:
+  - 'minimum_nights': 
+    - 1–3: short-stay tourist
+    - 4–6: medium-short
+    - 7–27: weekly/mid-stay
+    - 28+: pseudo long-term (regulatory avoidance signal)
+  - 'maximum_nights': 
+    - 2–14: Host wants only short stays; avoids tenant rights that kick in with longer residencies
+    - 30: Common round-number cap, often tied to local legal thresholds
+    - 365: Host is essentially open to any stay length; often a default or placeholder
+    - 1125: Airbnb's platform default when no max is set by the host, roughly 3 years; it is not meaningful as a real limit; treat it as a "no effective maximum" flag
+      - not a real business decision; recoding it (e.g., to NaN or a flag like no_max_set = True) rather than treating it as a numeric value, since including it in any model or mean calculation will heavily skew results
+- regulatory_category: cross ref of `property_type` × `room_type` to proxy regulatory exposure
+  - `entire_primary_likely`: entire apt/loft/condo - most likely a primary residence rented short-term, the target of Paris 120-night caps
+  - `room_rental`: private or shared room - host is present; typically exempt from whole-unit restrictions
+  - `entire_nonstandard`: entire house/boat/camper - whole-unit but lower regulatory scrutiny than apartments
+  - `commercial_type`: B&B or dorm - commercial operators; different regulatory framework
+  - `other`: uncategorized combinations
+  - priority order: `commercial_type` → `entire_primary_likely` → `entire_nonstandard` → `room_rental` → `other`
+    (commercial_type before room_rental to prevent B&B private rooms from being miscategorized)
+  - derived flags:
+    - `min_nights_avoidance_flag`: entire_primary_likely + min_nights ≥ 30 → pseudo long-term to avoid nightly caps
+    - `max_nights_risk_flag`: entire_primary_likely + max_nights ∈ {365, 1125} → effectively unlimited; 1125 is Airbnb's platform default "no cap set"
+
+```{r regulatory-category}
+# Airbnb's newer schema encodes room type into property_type strings
+# (e.g. "Private room in apartment", "Entire rental unit"), so exact-match
+# vectors are insufficient - regex patterns on property_type are used instead.
+# room_type still cleanly separates the four top-level modes.
+
+# commercial: hotel/hospitality operations; checked FIRST so B&B private rooms
+# don't fall into room_rental
+pat_commercial <- regex(
+  "hotel|hostel|bed and breakfast|bed & breakfast|\\bresort\\b|aparthotel|\\bdorm\\b",
+  ignore_case = TRUE
+)
+
+# primary-likely: apartment-style units most exposed to Paris 120-night cap;
+# "rental unit" and "residential" capture the newer verbose Airbnb labels
+pat_primary <- regex(
+  "apartment|condominium|condo|\\bloft\\b|serviced|rental unit|residential|entire home|entire place|\\bfloor\\b",
+  ignore_case = TRUE
+)
+# entire_nonstandard is the implicit fallback for any remaining Entire home/apt -
+# no pattern needed; handled by the bare room_type == "Entire home/apt" arm
+
+train_clean <- train_clean %>%
+  mutate(
+    regulatory_category = case_when(
+      # 1. commercial: hotel room_type OR hospitality property_type
+      room_type == "Hotel room" | str_detect(property_type, pat_commercial) ~ "commercial_type",
+      # 2. entire primary: whole apartment-style unit; highest Paris cap exposure
+      room_type == "Entire home/apt" & str_detect(property_type, pat_primary) ~ "entire_primary_likely",
+      # 3. entire nonstandard: whole unit but house / villa / unique property
+      room_type == "Entire home/apt"                                         ~ "entire_nonstandard",
+      # 4. room rental: private or shared (after commercial filter)
+      room_type %in% c("Private room", "Shared room")                       ~ "room_rental",
+      TRUE                                                                   ~ "other"
+    ) %>% factor(),
+    min_nights_avoidance_flag = regulatory_category == "entire_primary_likely" & minimum_nights >= 30,
+    # 365 = deliberate host choice (open to long stays, likely secondary/professional operator)
+    # 1125 = Airbnb platform default; host never configured - no real business signal
+    max_nights_risk_flag = case_when(
+      regulatory_category == "entire_primary_likely" & maximum_nights == 365  ~ "cap_365",
+      regulatory_category == "entire_primary_likely" & maximum_nights == 1125 ~ "no_max_set",
+      TRUE                                                                     ~ "other"
+    ) %>% factor(levels = c("other", "cap_365", "no_max_set"))
+  )
+
+test_clean <- test_clean %>%
+  mutate(
+    regulatory_category = case_when(
+      # 1. commercial: hotel room_type OR hospitality property_type
+      room_type == "Hotel room" | str_detect(property_type, pat_commercial) ~ "commercial_type",
+      # 2. entire primary: whole apartment-style unit; highest Paris cap exposure
+      room_type == "Entire home/apt" & str_detect(property_type, pat_primary) ~ "entire_primary_likely",
+      # 3. entire nonstandard: whole unit but house / villa / unique property
+      room_type == "Entire home/apt"                                         ~ "entire_nonstandard",
+      # 4. room rental: private or shared (after commercial filter)
+      room_type %in% c("Private room", "Shared room")                       ~ "room_rental",
+      TRUE                                                                   ~ "other"
+    ) %>% factor(),
+    min_nights_avoidance_flag = regulatory_category == "entire_primary_likely" & minimum_nights >= 30,
+    # 365 = deliberate host choice (open to long stays, likely secondary/professional operator)
+    # 1125 = Airbnb platform default; host never configured - no real business signal
+    max_nights_risk_flag = case_when(
+      regulatory_category == "entire_primary_likely" & maximum_nights == 365  ~ "cap_365",
+      regulatory_category == "entire_primary_likely" & maximum_nights == 1125 ~ "no_max_set",
+      TRUE                                                                     ~ "other"
+    ) %>% factor(levels = c("other", "cap_365", "no_max_set"))
+  )
+
+
+# value counts
+cat("=== regulatory_category counts ===\n")
+train_clean %>%
+  count(regulatory_category, sort = TRUE) %>%
+  mutate(pct = scales::percent(n / sum(n), accuracy = 0.1)) %>%
+  print()
+
+# inspect 'other' - should be near-zero after regex coverage
+cat("\n=== 'other' breakdown (property_type × room_type) ===\n")
+train_clean %>%
+  filter(regulatory_category == "other") %>%
+  count(property_type, room_type, sort = TRUE) %>%
+  print(n = 20)
+
+# crosstab: regulatory_category vs min_nights_avoidance_flag
+cat("\n=== regulatory_category × min_nights_avoidance_flag ===\n")
+train_clean %>%
+  count(regulatory_category, min_nights_avoidance_flag) %>%
+  pivot_wider(names_from = min_nights_avoidance_flag, values_from = n, values_fill = 0) %>%
+  print()
+
+# crosstab: regulatory_category vs max_nights_risk_flag
+cat("\n=== regulatory_category × max_nights_risk_flag ===\n")
+train_clean %>%
+  count(regulatory_category, max_nights_risk_flag) %>%
+  pivot_wider(names_from = max_nights_risk_flag, values_from = n, values_fill = 0) %>%
+  print()
+```
+
+| Feature | Keep with raws? | Rationale |
+|:---|:---:|:---|
+| `regulatory_category` | Replace *or* keep all | Redundant alongside `property_type` + `room_type` in a linear model; fine to keep all three for tree-based |
+| `min_nights_avoidance_flag` | Keep alongside `minimum_nights` | Captures the specific ≥ 30 threshold signal the raw value misses |
+| `max_nights_risk_flag` (`cap_365` / `no_max_set`) | Keep alongside `maximum_nights` | Distinguishes deliberate choice (`365`) from unconfigured default (`1125`) |
+
+
+```{r amenities-parsing}
+parse_amenities <- function(df) {
+  df %>%
+    mutate(
+      am = ifelse(is.na(amenities), "", tolower(as.character(amenities))),
+      nm = ifelse(is.na(name),      "", tolower(as.character(name))),
+      amenity_has_wifi    = as.integer(grepl("wifi|internet|wireless", am)),
+      amenity_has_pool    = as.integer(grepl("\\bpool\\b", am)),
+      amenity_has_parking = as.integer(grepl("parking", am)),
+      amenity_has_kitchen = as.integer(grepl("kitchen", am)),
+      has_luxury_keyword  = as.integer(grepl(
+        "rooftop|luxury|penthouse|ocean view|beach|resort|panoramic|infinity|designer",
+        nm
+      ))
+    ) %>%
+    select(-am, -nm)
+}
+
+train_clean <- parse_amenities(train_clean)
+test_clean  <- parse_amenities(test_clean)
+```
+
+```{r host-quality-signals}
+host_quality <- function(df) {
+  df %>%
+    mutate(
+      is_multi_listing_host = as.integer(!is.na(host_total_listings_count) & host_total_listings_count > 1),
+      host_experience_proxy = as.numeric(ifelse(is.na(host_about), 0, str_count(host_about, "\\w+")))
+    )
+}
+
+train_clean <- host_quality(train_clean)
+test_clean  <- host_quality(test_clean)
+```
+
+```{r complete-listings}
+train_clean <- train_clean %>%
+  mutate(
+    complete_listings = as.integer(
+      # core physical attributes
+      !is.na(accommodates) & accommodates > 0 &
+      !is.na(bathrooms)    & bathrooms > 0 &
+      !is.na(bedrooms)     & bedrooms > 0 &
+      !is.na(beds)         & beds > 0 &
+      !is.na(bed_type)     & bed_type != "N/A" &
+      # listing type
+      !is.na(property_type) & !property_type %in% c("N/A", "") &
+      !is.na(room_type)     & !room_type %in% c("N/A", "") &
+      # policy & amenities
+      !is.na(cancellation_policy) & !cancellation_policy %in% c("N/A", "") &
+      !is.na(amenities)           & !amenities %in% c("", "0") &
+      # host responsiveness
+      !is.na(host_response_time) & !host_response_time %in% c("N/A", "") &
+      !is.na(host_response_rate) & !host_response_rate %in% c("N/A", "") &
+      # listing description
+      !is.na(name)        & name != "" &
+      !is.na(description) & description != ""
+    )
+  )
+
+test_clean <- test_clean %>%
+  mutate(
+    complete_listings = as.integer(
+      # core physical attributes
+      !is.na(accommodates) & accommodates > 0 &
+      !is.na(bathrooms)    & bathrooms > 0 &
+      !is.na(bedrooms)     & bedrooms > 0 &
+      !is.na(beds)         & beds > 0 &
+      !is.na(bed_type)     & bed_type != "N/A" &
+      # listing type
+      !is.na(property_type) & !property_type %in% c("N/A", "") &
+      !is.na(room_type)     & !room_type %in% c("N/A", "") &
+      # policy & amenities
+      !is.na(cancellation_policy) & !cancellation_policy %in% c("N/A", "") &
+      !is.na(amenities)           & !amenities %in% c("", "0") &
+      # host responsiveness
+      !is.na(host_response_time) & !host_response_time %in% c("N/A", "") &
+      !is.na(host_response_rate) & !host_response_rate %in% c("N/A", "") &
+      # listing description
+      !is.na(name)        & name != "" &
+      !is.na(description) & description != ""
+    )
+  )
+
+# distribution of complete listings
+train_clean %>% count(complete_listings)
+```
+
+```{r impute-values-from-above}
+# new binary flag, 'has_property_details'
+train_clean <- train_clean %>%
+    mutate(
+        has_property_details = as.integer(ifelse(is.na(guests_included) | is.na(bathrooms), 0, 1))
+    )
+
+test_clean <- test_clean %>%
+    mutate(
+        has_property_details = as.integer(ifelse(is.na(guests_included) | is.na(bathrooms), 0, 1))
+    )
+
+# bathrooms
+train_bathrooms_median <- median(train_clean$bathrooms, na.rm = TRUE)
+
+train_clean <- train_clean %>%
+    mutate(bathrooms = if_else(is.na(bathrooms), train_bathrooms_median, bathrooms))
+
+test_clean <- test_clean %>%
+    mutate(bathrooms = if_else(is.na(bathrooms), train_bathrooms_median, bathrooms))
+
+
+# guests_included
+train_clean <- train_clean %>%
+    mutate(
+        guests_included = if_else(is.na(guests_included), 1, guests_included)
+    )
+
+test_clean <- test_clean %>%
+    mutate(
+        guests_included = if_else(is.na(guests_included), 1, guests_included)
+    )
+
+# beds
+train_clean <- train_clean %>%
+    mutate(
+        beds = if_else(is.na(beds), ceiling(accommodates / 2), beds)
+    )
+
+test_clean <- test_clean %>%
+    mutate(
+        beds = if_else(is.na(beds), ceiling(accommodates / 2), beds)
+    )
+
+# bedrooms: impute with 0 - NA bedrooms are studios
+train_clean <- train_clean %>%
+    mutate(bedrooms = if_else(is.na(bedrooms), 0L, as.integer(bedrooms)))
+
+test_clean <- test_clean %>%
+    mutate(bedrooms = if_else(is.na(bedrooms), 0L, as.integer(bedrooms)))
+
+# remove bedroom outliers (>10) from train; cap test since rows can't be dropped
+train_clean <- train_clean %>% filter(bedrooms <= 10)
+test_clean  <- test_clean  %>% mutate(bedrooms = pmin(bedrooms, 10L))
+
+# extra_people, security_deposit, cleaning_fee impute w 0
+train_clean <- train_clean %>%
+    mutate(
+        extra_people = if_else(is.na(extra_people), 0, extra_people),
+        security_deposit = if_else(is.na(security_deposit), 0, security_deposit),
+        cleaning_fee = if_else(is.na(cleaning_fee), 0, cleaning_fee)
+    )
+
+test_clean <- test_clean %>%
+    mutate(
+        extra_people = if_else(is.na(extra_people), 0, extra_people),
+        security_deposit = if_else(is.na(security_deposit), 0, security_deposit),
+        cleaning_fee = if_else(is.na(cleaning_fee), 0, cleaning_fee)
+    )
+
+# reviews_per_month impute 0
+train_clean <- train_clean %>%
+    mutate(
+        reviews_per_month = if_else(is.na(reviews_per_month), 0, reviews_per_month)
+    )
+
+test_clean <- test_clean %>%
+    mutate(
+        reviews_per_month = if_else(is.na(reviews_per_month), 0, reviews_per_month)
+    )
+
+# new binary flag, 'has_reviews'
+train_clean <- train_clean %>%
+    mutate(
+        has_reviews = ifelse(is.na(review_scores_rating), 0, 1)
+    )
+
+test_clean <- test_clean %>%
+    mutate(
+        has_reviews = ifelse(is.na(review_scores_rating), 0, 1)
+    )
+
+# review sub-score imputation + categorization
+# sub-scores (1–10 scale): if a reviewer left an overall rating but skipped a
+# dimension, impute with 10 when P25 == 10 (i.e. the score is overwhelmingly 10)
+review_sub_cols <- c(
+    "review_scores_accuracy", "review_scores_cleanliness",
+    "review_scores_checkin",  "review_scores_communication",
+    "review_scores_location",  "review_scores_value"
+)
+
+p25_vals <- sapply(review_sub_cols, function(col) quantile(train_clean[[col]], 0.25, na.rm = TRUE))
+print(p25_vals)
+
+for (col in names(p25_vals[p25_vals == 10])) {
+    train_clean[[col]] <- if_else(train_clean$has_reviews == 1 & is.na(train_clean[[col]]), 10, train_clean[[col]])
+    test_clean[[col]]  <- if_else(test_clean$has_reviews  == 1 & is.na(test_clean[[col]]),  10, test_clean[[col]])
+}
+
+# categorize: 0 = no reviews, 1 = unsatisfactory (<10), 2 = satisfactory (==10)
+cat_review <- function(score, has_rev) {
+    case_when(
+        has_rev == 0 | is.na(score) ~ 0L,
+        score < 10                  ~ 1L,
+        TRUE                        ~ 2L
+    )
+}
+
+train_clean <- train_clean %>%
+    mutate(across(all_of(review_sub_cols), ~ cat_review(.x, has_reviews)))
+
+test_clean <- test_clean %>%
+    mutate(across(all_of(review_sub_cols), ~ cat_review(.x, has_reviews)))
+
+```
+
+```{r pricing-signals}
+# NOTE: runs after imputation so cleaning_fee/security_deposit are already filled with 0
+pricing_signals <- function(df) {
+  df %>%
+    mutate(
+      total_cost         = price + replace_na(cleaning_fee, 0) + replace_na(security_deposit, 0),
+      cleaning_fee_ratio = replace_na(cleaning_fee, 0) / pmax(price, 1)
+    )
+}
+
+train_clean <- pricing_signals(train_clean)
+test_clean  <- pricing_signals(test_clean)
+```
+
+```{r imputation-check-typing}
+# price outliers, cap at 99th percentile
+price_cap <- quantile(train_clean$price, 0.99, na.rm = TRUE)
+
+train_clean <- train_clean %>% filter(price > 0 & price <= price_cap)
+
+# test, can't drop rows, cap instead
+test_clean <- test_clean %>%
+  mutate(
+    price = pmax(pmin(price, price_cap), 1),
+    price_per_person = pmin(price_per_person, price_cap / pmax(accommodates, 1))
+  )
+
+# zipcode cleaning, keep only zipcodes that cover >= 0.1% of listings
+train_clean <- train_clean %>%
+  mutate(zipcode = fct_lump_prop(zipcode, prop = 0.001, other_level = "other"))
+
+# map any unseen or rare zipcode to "other" using train levels
+train_zip_levels <- levels(train_clean$zipcode)
+test_clean <- test_clean %>%
+  mutate(zipcode = factor(
+    ifelse(as.character(zipcode) %in% train_zip_levels, as.character(zipcode), "other"),
+    levels = train_zip_levels
+  ))
+nlevels(train_clean$zipcode)
+
+table(train_clean$is_location_exact)
+
+
+# add description_length feature 
+train_clean <- train_clean %>%
+  mutate(description_length = as.numeric(nchar(description)) %>% replace_na(0))
+
+
+test_clean <- test_clean %>%
+  mutate(description_length = as.numeric(nchar(description)) %>% replace_na(0))
+
+```
+
+```{r check-na-distribution}
+# check na's for all columns in train and test
+sum(is.na(train_clean))
+# colSums(is.na(test_clean))
+```
+
+```{r causality-problem}
+# look into why review_scores_rating may be lower vs higher
+# causal problem: do more overall amenities (beds, bathrooms, guests, people, bedrooms, etc) lead to a higher review? 
+
+```

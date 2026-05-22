@@ -1,0 +1,312 @@
+
+```{r check-na-strings}
+# different na string spellings
+na_strings <- c("N/A", "NA", "n/a", "na", "None", "NULL", "", "-", "unknown")
+
+# count of na strings in each character column
+train_clean %>%
+  select(where(is.character)) %>%
+  summarise(across(everything(), ~ sum(. %in% na_strings, na.rm = TRUE))) %>%
+  pivot_longer(everything(), names_to = "column", values_to = "count") %>%
+  filter(count > 0)
+
+# list of unique na strings in each character column
+train_clean %>%
+  select(where(is.character)) %>%
+  summarise(across(everything(), ~ list(unique(.[. %in% c("N/A", "NA", "n/a", "na", "None", "none", "NULL", "null", "", " ", "-", "--", "?", "unknown", "Unknown")]))))  %>%
+  pivot_longer(everything(), names_to = "column", values_to = "na_strings") %>%
+  unnest(na_strings) %>%
+  filter(lengths(na_strings) > 0)
+
+# list of unique na strings in each character column of test data
+test_clean %>%
+  select(where(is.character)) %>%
+  summarise(across(everything(), ~ list(unique(.[. %in% c("N/A", "NA", "n/a", "na", "None", "none", "NULL", "null", "", " ", "-", "--", "?", "unknown", "Unknown")]))))  %>%
+  pivot_longer(everything(), names_to = "column", values_to = "na_strings") %>%
+  unnest(na_strings) %>%
+  filter(lengths(na_strings) > 0)
+
+```
+
+- identified that there are different na string spellings in the data
+- need to handle these na strings in the data cleaning pipeline otherwise they will be treated as categorical values, negatively impacting how the columns are treated (chr vs num)
+
+
+```{r correlation-checks-train-set}
+# na's of each variable
+colSums(is.na(train_clean))
+
+# distribution of host_response_time
+table(train_clean$host_response_time)
+
+# check rows where host_response_time is NA
+train_clean %>% filter(is.na(host_response_time)) %>% print(width = Inf)
+
+# check columns where both host_name and host_response_rate are na
+train_clean %>% filter(is.na(host_name) & is.na(host_response_rate)) %>% print(width = Inf)
+
+# check correlation between host_about and host_response_rate
+# 1. make both columns numeric (binary, 0 if a value is not contained, 1 if there is one or more value)
+train_clean %>%
+  mutate(
+    host_about_numeric = ifelse(is.na(host_about), 0, 1),
+    host_response_rate_numeric = ifelse(is.na(host_response_rate), 0, 1)
+  ) %>%
+  select(host_about_numeric, host_response_rate_numeric) %>%
+  cor()
+
+# 2. create host_about_binary column
+train_clean %>%
+  mutate(
+    host_about_binary = ifelse(is.na(host_about), 0, 1)
+  )
+# check na's in host_about_binary
+sum(is.na(train_clean$host_about_binary))
+
+# check correlation between host_response_rate and host_total_listings_count
+# 1. convert both to binary
+train_clean %>%
+  mutate(
+    host_response_rate_binary = ifelse(is.na(host_response_rate), 0, 1),
+    host_total_listings_count_binary = ifelse(is.na(host_total_listings_count), 0, 1)
+  ) %>% 
+  select(host_response_rate_binary, host_total_listings_count_binary) %>%
+  cor()
+
+# check correlation between host_response_rate and host_response_time
+# a. convert both to binary
+train_clean %>%
+  mutate(
+    host_response_rate_binary = ifelse(is.na(host_response_rate), 0, 1),
+    host_response_time_binary = ifelse(is.na(host_response_time), 0, 1)
+  ) %>%
+  select(host_response_rate_binary, host_response_time_binary) %>%
+  cor()
+
+# b. hosts w/out response data are likely newer or less active
+# impute na's for host_response_rate as a new factor level: "unknown"
+train_clean %>%
+  mutate(
+    host_has_response_data = as.factor(ifelse(is.na(host_response_rate), 0, 1)),
+    host_response_rate = replace_na(host_response_rate, 0),
+    host_response_time = as.factor(ifelse(is.na(host_response_time), "unknown", as.character(host_response_time)))
+  )
+
+sum(is.na(train_clean$host_response_rate))
+sum(is.na(train_clean$host_response_time))
+sum(is.na(train_clean$host_has_response_data))
+
+# 2a. distribution of guests_included
+table(train_clean$guests_included)
+
+# 2b. check rows where guests_included is NA
+train_clean %>% filter(is.na(guests_included)) %>% print(width = Inf)
+
+# 2c. make binary features for guests_included, beds, bedrooms, bathrooms
+train_clean %>%
+  mutate(
+    guests_included_binary = ifelse(is.na(guests_included), 0, 1),
+    beds_binary = ifelse(is.na(beds), 0, 1),
+    bedrooms_binary = ifelse(is.na(bedrooms), 0, 1),
+    bathrooms_binary = ifelse(is.na(bathrooms), 0, 1),
+    accommodates_binary = ifelse(is.na(accommodates), 0, 1)
+  ) %>% 
+  select(guests_included_binary, beds_binary, bedrooms_binary, bathrooms_binary, accommodates_binary) %>%
+  cor()
+
+# 3a. correlation of pricing-fields
+train_clean %>%
+  mutate(
+    extra_people_binary = ifelse(is.na(extra_people), 0, 1),
+    security_deposit_binary = ifelse(is.na(security_deposit), 0, 1),
+    cleaning_fee_binary = ifelse(is.na(cleaning_fee), 0, 1),
+    weekly_price_binary = ifelse(is.na(weekly_price), 0, 1)
+  ) %>%
+  select(extra_people_binary, security_deposit_binary, cleaning_fee_binary, weekly_price_binary) %>%
+  cor()
+
+# 4a. correlation of review features
+train_clean %>% 
+  select(review_scores_rating, review_scores_accuracy, review_scores_cleanliness, review_scores_checkin, 
+         review_scores_communication, review_scores_location, review_scores_value) %>%
+  cor(use = "complete.obs")
+
+# 4b. check whether reviews_per_month na's align perfectly with the review score na's
+train_clean %>%
+  mutate(
+    rating_binary = ifelse(is.na(review_scores_rating), 0, 1),
+    rpm_binary = ifelse(is.na(reviews_per_month), 0, 1)
+  ) %>%
+  select(rating_binary, rpm_binary) %>%
+  cor()
+
+# 4c. reviews_per_month na's align with rating na's - will impute with 0 in chunk 3
+# (shown here as exploratory only; actual imputation happens in impute-values-from-above)
+```
+
+```{r correlation-checks-test-set}
+# na's of each variable
+colSums(is.na(test_clean))
+
+# distribution of host_response_time
+table(test_clean$host_response_time)
+
+# check rows where host_response_time is NA
+test_clean %>% filter(is.na(host_response_time)) %>% print(width = Inf)
+
+# check columns where both host_name and host_response_rate are na
+test_clean %>% filter(is.na(host_name) & is.na(host_response_rate)) %>% print(width = Inf)
+
+# check correlation between host_about and host_response_rate
+# 1. make both columns numeric (binary, 0 if a value is not contained, 1 if there is one or more value)
+test_clean %>%
+  mutate(
+    host_about_numeric = ifelse(is.na(host_about), 0, 1),
+    host_response_rate_numeric = ifelse(is.na(host_response_rate), 0, 1)
+  ) %>%
+  select(host_about_numeric, host_response_rate_numeric) %>%
+  cor()
+
+# 2. create host_about_binary column
+test_clean %>%
+  mutate(
+    host_about_binary = ifelse(is.na(host_about), 0, 1)
+  )
+# check na's in host_about_binary
+sum(is.na(test_clean$host_about_binary))
+
+# check correlation between host_response_rate and host_total_listings_count
+# 1. convert both to binary
+test_clean %>%
+  mutate(
+    host_response_rate_binary = ifelse(is.na(host_response_rate), 0, 1),
+    host_total_listings_count_binary = ifelse(is.na(host_total_listings_count), 0, 1)
+  ) %>% 
+  select(host_response_rate_binary, host_total_listings_count_binary) %>%
+  cor()
+
+# check correlation between host_response_rate and host_response_time
+# a. convert both to binary
+test_clean %>%
+  mutate(
+    host_response_rate_binary = ifelse(is.na(host_response_rate), 0, 1),
+    host_response_time_binary = ifelse(is.na(host_response_time), 0, 1)
+  ) %>%
+  select(host_response_rate_binary, host_response_time_binary) %>%
+  cor()
+
+# b. hosts w/out response data are likely newer or less active
+# impute na's for host_response_rate as a new factor level: "unknown"
+test_clean %>%
+  mutate(
+    host_has_response_data = as.factor(ifelse(is.na(host_response_rate), 0, 1)),
+    host_response_rate = replace_na(host_response_rate, 0),
+    host_response_time = as.factor(ifelse(is.na(host_response_time), "unknown", as.character(host_response_time)))
+  )
+
+sum(is.na(test_clean$host_response_rate))
+sum(is.na(test_clean$host_response_time))
+sum(is.na(test_clean$host_has_response_data))
+
+# 2a. distribution of guests_included
+table(test_clean$guests_included)
+
+# 2b. check rows where guests_included is NA
+test_clean %>% filter(is.na(guests_included)) %>% print(width = Inf)
+
+# 2c. make binary features for guests_included, beds, bedrooms, bathrooms
+test_clean %>%
+  mutate(
+    guests_included_binary = ifelse(is.na(guests_included), 0, 1),
+    beds_binary = ifelse(is.na(beds), 0, 1),
+    bedrooms_binary = ifelse(is.na(bedrooms), 0, 1),
+    bathrooms_binary = ifelse(is.na(bathrooms), 0, 1),
+    accommodates_binary = ifelse(is.na(accommodates), 0, 1)
+  ) %>% 
+  select(guests_included_binary, beds_binary, bedrooms_binary, bathrooms_binary, accommodates_binary) %>%
+  cor()
+
+# 3a. correlation of pricing-fields
+test_clean %>%
+  mutate(
+    extra_people_binary = ifelse(is.na(extra_people), 0, 1),
+    security_deposit_binary = ifelse(is.na(security_deposit), 0, 1),
+    cleaning_fee_binary = ifelse(is.na(cleaning_fee), 0, 1),
+    weekly_price_binary = ifelse(is.na(weekly_price), 0, 1)
+  ) %>%
+  select(extra_people_binary, security_deposit_binary, cleaning_fee_binary, weekly_price_binary) %>%
+  cor()
+
+# 4a. correlation of review features
+test_clean %>% 
+  select(review_scores_rating, review_scores_accuracy, review_scores_cleanliness, review_scores_checkin, 
+         review_scores_communication, review_scores_location, review_scores_value) %>%
+  cor(use = "complete.obs")
+
+# 4b. check whether reviews_per_month na's align perfectly with the review score na's
+test_clean %>%
+  mutate(
+    rating_binary = ifelse(is.na(review_scores_rating), 0, 1),
+    rpm_binary = ifelse(is.na(reviews_per_month), 0, 1)
+  ) %>%
+  select(rating_binary, rpm_binary) %>%
+  cor()
+
+# 4c. reviews_per_month na's align with rating na's - will impute with 0 in chunk 3
+# (shown here as exploratory only; actual imputation happens in impute-values-from-above)
+```
+
+```{r host-response-data-eda}
+# NOTE: must run before select-features in chunk 4 (host_has_response_data is dropped there)
+
+train_clean %>%
+  group_by(host_has_response_data) %>%
+  summarise(pct_high_booking = mean(as.integer(high_booking) - 1), n = n())
+
+# does it correlate with city or other structural vars?
+train_clean %>%
+  group_by(host_has_response_data) %>%
+  summarise(
+    pct_high_booking = mean(as.integer(high_booking) - 1),
+    median_price     = median(price, na.rm = TRUE),
+    median_reviews   = median(reviews_per_month, na.rm = TRUE),
+    n = n()
+  )
+
+# does response data missingness align with other missing fields?
+train_clean %>%
+  mutate(no_response_data = host_has_response_data == 0) %>%
+  summarise(across(where(is.numeric), ~ mean(is.na(.) & no_response_data == TRUE)))
+
+```
+
+**1:**
+
+- added new binary feature: host_about_binary
+- added new binary feature: host_has_response_data
+- added new categorical feature: host_response_time (with "unknown" as a level)
+
+**2:**
+
+- use accomodates as a proxy for other features (beds, bedrooms, bathrooms, guests_included)
+    - accommodates being fully populated while beds/bedrooms have independent NAs means you can derive reasonable imputations like beds = ceiling(accommodates / 2) or bedrooms = floor(accommodates / 2) for missing rows rather than just using the global median
+        - guests_included + bathrooms; Impute together; bathrooms→median, guests_included→1
+            - has_property_details; shared binary flag bc essentially the same rows are missing (r = 0.995); capturing basic structural property details
+        - beds; Impute via accommodates (e.g. accommodates / 2) or median
+        - bedrooms; Impute via accommodates or median
+        
+**3:**
+
+- extra_people + security_deposit + cleaning_fee (r = 0.68 - 0.8)
+    - all optional fee fields that engaged/professional hosts tend to configure together
+    - impute all three with 0
+- weekly_price is independent (r = 0.16–0.27)
+
+**4:**
+
+- looked into correlation of all the review features
+- all 7 review scores are nearly identical (r = 0.94–0.98) 
+    - leading to multicollinearity issues, keeping all would add noise and redundancy
+- between reviews_per_month and review_rating_binary, r = 0.967
+    - some listings have a reviews_per_month but no individual score breakdowns
+- given the extreme multicollinearity finding (r > 0.94), keep only review_scores_rating + reviews_per_month

@@ -1,0 +1,55 @@
+
+## Goal: 
+
+**Text analysis of 'Description' only:**
+
+look into the following:
+
+- length of description
+- topic modeling 
+
+```{r library-setup}
+#| output: false
+library(dplyr) # for data manipulation
+library(purrr) # for functional programming
+library(readr) # for reading data
+
+# text analysis libs
+library(tidyverse) # for data manipulation and visualization
+library(tidytext) # for text analysis
+library(tidytable)
+library(topicmodels) # for topic modeling
+library(tm) # for text mining
+library(topicdoc) # for topic modeling
+library(textdata) # for text data
+
+# set seed
+set.seed(21)
+```
+
+```{r load-test-data}
+# load data using 'tidytable'
+train_data <- fread("C:\\Users\\ramse\\msba-courses\\ds 810\\data\\airbnb-project-msba-kaggle-test.csv", na = c("", "NA", "N/A", "n/a", "-"))
+glimpse(train_data)
+
+# load train data
+test_data <- fread("C:\\Users\\ramse\\msba-courses\\ds 810\\data\\airbnb-project-msba-kaggle-train.csv", na = c("", "NA", "N/A", "n/a", "-"))
+glimpse(test_data)
+```
+
+*Note:*
+
+I have a long string of na's because there are different written formats for the na's here, not just the usual. 
+
+Also, if i didn't change the data source string from my personal use, then be sure to use the data source in the correct location in Posit.
+
+```{r pull-description}
+# bc we are only looking at description pull just description
+desc_train <- train_data %>% 
+  select(description)
+head(desc_train)
+
+desc_test <- test_data %>% 
+  select(description)
+head(desc_test)
+```

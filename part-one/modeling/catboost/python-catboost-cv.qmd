@@ -1,0 +1,1567 @@
+# library import
+
+```{python libraries}
+# library setup
+import pandas as pd # data manipulation
+import numpy as np # numerical operations
+import matplotlib.pyplot as plt # plotting
+import seaborn as sns # statistical data visualization
+import catboost as cb # gradient boosting library
+import polars as pl # fast data manipulation
+from functools import reduce # functional programming
+from itertools import chain, product # iteration utilities
+from sklearn.pipeline import Pipeline # machine learning pipelines
+from sklearn.model_selection import GridSearchCV, RandomizedSearchCV, train_test_split # model selection
+from sklearn.preprocessing import StandardScaler, OneHotEncoder # data preprocessing
+from sklearn.metrics import classification_report, mean_squared_error # model evaluation
+import optuna # hyperparameter optimization
+import category_encoders as ce # target, binary, hashing encoders
+from sklearn.decomposition import PCA
+import umap # UMAP dimensionality reduction
+from catboost import CatBoostClassifier, CatBoostRegressor
+import shap # model interpretability
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, Matern
+from scipy.stats.qmc import LatinHypercube, scale
+import vetiver # model deployment
+import pins # model registry
+from fastapi import FastAPI # web framework
+import uvicorn # web server
+import pyarrow as pa
+```
+
+```{python}
+pl.Config.set_fmt_str_lengths(900)
+pl.Config.set_tbl_width_chars(900)
+pl.Config(tbl_rows=-1, tbl_cols=-1)
+```
+
+# load and prelim clean data
+
+```{python train-load}
+train_data = pl.read_csv("C:/Users/ramse/msba-courses/ds 810/data/airbnb-project-msba-kaggle-train.csv", null_values=["", "NA", "N/A", "n/a", "-"], infer_schema_length=0, has_header=True)
+
+train_data.glimpse()
+```
+
+```{python train-clean}
+# clean train data
+train_clean = train_data.select([
+    "high_booking", "host_id", "host_location", "host_response_time", "host_response_rate", "host_is_superhost", "latitude", "longitude", "property_type", "room_type", "accommodates", "bathrooms", "bedrooms", "beds", "bed_type", "square_feet", "price", "weekly_price", "monthly_price", "guests_included", "extra_people", "minimum_nights", "maximum_nights", "review_scores_rating", "review_scores_accuracy", "review_scores_cleanliness", "review_scores_checkin", "review_scores_communication", "review_scores_location", "review_scores_value", "reviews_per_month", "host_listings_count", "host_total_listings_count", "amenities", "security_deposit", "cleaning_fee", "instant_bookable", "latitude_cleansed", "longitude_cleansed", "host_name", "host_about", "host_acceptance_rate", "cancellation_policy", "zipcode", "name", "description", "neighbourhood_cleansed", "is_location_exact", "picture_url", "host_picture_url",
+    "summary", "space", "neighborhood_overview", "access", "interaction", "house_rules", "transit",
+    "host_identity_verified", "requires_license",
+    "host_verifications", "license", "bathrooms_text",
+    "listing_url", "state", "market", "city",
+    "require_guest_profile_picture", "require_guest_phone_verification", "is_business_travel_ready",
+])
+
+train_clean = train_clean.with_columns([
+    # high booking to int then categorical
+    pl.col("high_booking")
+    .cast(pl.Int32, strict=False)
+    .cast(pl.Utf8)
+    .cast(pl.Categorical),
+    # host response time replace na then cat
+    pl.when(pl.col("host_response_time") == "N/A")
+    .then(None)
+    .otherwise(pl.col("host_response_time"))
+    .cast(pl.Categorical),
+    # strip % and cast to float64
+    pl.col("host_response_rate")
+    .str.replace("%", "", literal=True)
+    .cast(pl.Float64),
+    pl.col("host_acceptance_rate")
+    .str.replace("%", "", literal=True)
+    .cast(pl.Float64),
+    # categorical columns
+    pl.col("host_is_superhost").cast(pl.Categorical),
+    pl.col("bed_type").cast(pl.Categorical),
+    pl.col("instant_bookable").cast(pl.Categorical),
+    pl.col("zipcode").cast(pl.Categorical),
+    pl.col("is_location_exact").cast(pl.Categorical),
+    pl.col("cancellation_policy").cast(pl.Categorical),
+    pl.col("neighbourhood_cleansed").cast(pl.Categorical),
+    pl.col("state").fill_null("Unknown").cast(pl.Categorical),
+    pl.col("city").fill_null("Unknown").cast(pl.Categorical),
+    # numeric columns
+    pl.col("latitude").cast(pl.Float64, strict=False),
+    pl.col("longitude").cast(pl.Float64, strict=False),
+    pl.col("latitude_cleansed").cast(pl.Float64, strict=False),
+    pl.col("longitude_cleansed").cast(pl.Float64, strict=False),
+    pl.col("accommodates").cast(pl.Int32, strict=False),
+    pl.col("bathrooms").cast(pl.Float64, strict=False),
+    pl.col("bedrooms").cast(pl.Float64, strict=False),
+    pl.col("beds").cast(pl.Float64, strict=False),
+    pl.col("square_feet").cast(pl.Float64, strict=False),
+    pl.col("guests_included").cast(pl.Int32, strict=False),
+    pl.col("minimum_nights").cast(pl.Int32, strict=False),
+    pl.col("maximum_nights").cast(pl.Int32, strict=False),
+    pl.col("review_scores_rating").cast(pl.Float64, strict=False),
+    pl.col("review_scores_accuracy").cast(pl.Float64, strict=False),
+    pl.col("review_scores_cleanliness").cast(pl.Float64, strict=False),
+    pl.col("review_scores_checkin").cast(pl.Float64, strict=False),
+    pl.col("review_scores_communication").cast(pl.Float64, strict=False),
+    pl.col("review_scores_location").cast(pl.Float64, strict=False),
+    pl.col("review_scores_value").cast(pl.Float64, strict=False),
+    pl.col("reviews_per_month").cast(pl.Float64, strict=False),
+    pl.col("host_listings_count").cast(pl.Int32, strict=False),
+    pl.col("host_total_listings_count").cast(pl.Int32, strict=False),
+    # strip $ and "," then cast to float64
+    pl.col("price")
+      .str.replace_all(r"[\$,]", "")
+      .cast(pl.Float64),
+    pl.col("weekly_price")
+      .str.replace_all(r"[\$,]", "")
+      .cast(pl.Float64),
+    pl.col("monthly_price")
+      .str.replace_all(r"[\$,]", "")
+      .cast(pl.Float64),
+    pl.col("extra_people")
+      .str.replace_all(r"[\$,]", "")
+      .cast(pl.Float64),
+    pl.col("security_deposit")
+      .str.replace_all(r"[\$,]", "")
+      .cast(pl.Float64),
+    pl.col("cleaning_fee")
+      .str.replace_all(r"[\$,]", "")
+      .cast(pl.Float64)
+])
+
+train_clean = train_clean.with_columns([
+    # price_per_person
+    (pl.col("price") / pl.col("accommodates").clip(lower_bound=1))
+      .alias("price_per_person"),
+    # amenity_count
+    pl.when(pl.col("amenities").is_null())
+      .then(0)
+      .otherwise(
+          pl.col("amenities")
+            .str.split(",")
+            .list.len()
+      )
+      .alias("amenity_count")
+])
+
+train_clean.glimpse()
+```
+
+```{python test-load}
+test_data = pl.read_csv("C:/Users/ramse/msba-courses/ds 810/data/airbnb-project-msba-kaggle-test.csv", null_values=["", "NA", "N/A", "n/a", "-"], infer_schema_length=0, has_header=True)
+
+test_data.glimpse()
+```
+
+```{python test-clean}
+# clean test data
+test_clean = test_data.select([
+    "unique_id", "host_location", "host_id", "host_response_time", "host_response_rate", "host_is_superhost", "latitude", "longitude", "property_type", "room_type", "accommodates", "bathrooms", "bedrooms", "beds", "bed_type", "square_feet", "price", "weekly_price", "monthly_price", "guests_included", "extra_people", "minimum_nights", "maximum_nights", "review_scores_rating", "review_scores_accuracy", "review_scores_cleanliness", "review_scores_checkin", "review_scores_communication", "review_scores_location", "review_scores_value", "reviews_per_month", "host_listings_count", "host_total_listings_count", "amenities", "security_deposit", "cleaning_fee", "instant_bookable", "latitude_cleansed", "longitude_cleansed", "host_name", "host_about", "host_acceptance_rate", "cancellation_policy", "zipcode", "name", "description", "neighbourhood_cleansed", "is_location_exact", "picture_url", "host_picture_url",
+    "summary", "space", "neighborhood_overview", "access", "interaction", "house_rules", "transit",
+    "host_identity_verified", "requires_license",
+    "host_verifications", "license", "bathrooms_text",
+    "listing_url", "state", "market", "city",
+    "require_guest_profile_picture", "require_guest_phone_verification", "is_business_travel_ready",
+])
+
+test_clean = test_clean.with_columns([
+    # host response time replace na then cat
+    pl.when(pl.col("host_response_time") == "N/A")
+    .then(None)
+    .otherwise(pl.col("host_response_time"))
+    .cast(pl.Categorical),
+    # strip % and cast to float64
+    pl.col("host_response_rate")
+    .str.replace("%", "", literal=True)
+    .cast(pl.Float64),
+    pl.col("host_acceptance_rate")
+    .str.replace("%", "", literal=True)
+    .cast(pl.Float64),
+    # categorical columns
+    pl.col("host_is_superhost").cast(pl.Categorical),
+    pl.col("bed_type").cast(pl.Categorical),
+    pl.col("instant_bookable").cast(pl.Categorical),
+    pl.col("zipcode").cast(pl.Categorical),
+    pl.col("is_location_exact").cast(pl.Categorical),
+    pl.col("cancellation_policy").cast(pl.Categorical),
+    pl.col("neighbourhood_cleansed").cast(pl.Categorical),
+    pl.col("state").fill_null("Unknown").cast(pl.Categorical),
+    pl.col("city").fill_null("Unknown").cast(pl.Categorical),
+    # numeric columns
+    pl.col("unique_id").cast(pl.Int64, strict=False),
+    pl.col("latitude").cast(pl.Float64, strict=False),
+    pl.col("longitude").cast(pl.Float64, strict=False),
+    pl.col("latitude_cleansed").cast(pl.Float64, strict=False),
+    pl.col("longitude_cleansed").cast(pl.Float64, strict=False),
+    pl.col("accommodates").cast(pl.Int32, strict=False),
+    pl.col("bathrooms").cast(pl.Float64, strict=False),
+    pl.col("bedrooms").cast(pl.Float64, strict=False),
+    pl.col("beds").cast(pl.Float64, strict=False),
+    pl.col("square_feet").cast(pl.Float64, strict=False),
+    pl.col("guests_included").cast(pl.Int32, strict=False),
+    pl.col("minimum_nights").cast(pl.Int32, strict=False),
+    pl.col("maximum_nights").cast(pl.Int32, strict=False),
+    pl.col("review_scores_rating").cast(pl.Float64, strict=False),
+    pl.col("review_scores_accuracy").cast(pl.Float64, strict=False),
+    pl.col("review_scores_cleanliness").cast(pl.Float64, strict=False),
+    pl.col("review_scores_checkin").cast(pl.Float64, strict=False),
+    pl.col("review_scores_communication").cast(pl.Float64, strict=False),
+    pl.col("review_scores_location").cast(pl.Float64, strict=False),
+    pl.col("review_scores_value").cast(pl.Float64, strict=False),
+    pl.col("reviews_per_month").cast(pl.Float64, strict=False),
+    pl.col("host_listings_count").cast(pl.Int32, strict=False),
+    pl.col("host_total_listings_count").cast(pl.Int32, strict=False),
+    # strip $ and "," then cast to float64
+    pl.col("price")
+      .str.replace_all(r"[\$,]", "")
+      .cast(pl.Float64),
+    pl.col("weekly_price")
+      .str.replace_all(r"[\$,]", "")
+      .cast(pl.Float64),
+    pl.col("monthly_price")
+      .str.replace_all(r"[\$,]", "")
+      .cast(pl.Float64),
+    pl.col("extra_people")
+      .str.replace_all(r"[\$,]", "")
+      .cast(pl.Float64),
+    pl.col("security_deposit")
+      .str.replace_all(r"[\$,]", "")
+      .cast(pl.Float64),
+    pl.col("cleaning_fee")
+      .str.replace_all(r"[\$,]", "")
+      .cast(pl.Float64)
+])
+
+test_clean = test_clean.with_columns([
+    # price_per_person
+    (pl.col("price") / pl.col("accommodates").clip(lower_bound=1))
+      .alias("price_per_person"),
+    # amenity_count
+    pl.when(pl.col("amenities").is_null())
+      .then(0)
+      .otherwise(
+          pl.col("amenities")
+            .str.split(",")
+            .list.len()
+      )
+      .alias("amenity_count")
+])
+
+test_clean.glimpse()
+```
+
+# exploring
+
+```{python hella-exploration}
+#| eval: false
+# sample of random 10 and seperate distribution of each text feature
+train_data.select("experiences_offered").sample(10)
+train_data.select("experiences_offered").to_series().value_counts(sort=True)
+
+# weird that the summary has at least 4 (which we can view probably more) that have same summary
+train_data.select("summary").sample(10)
+train_data.select("summary").to_series().value_counts(sort=True)
+
+# same weirdness occuring in space...could it be the gentrification OR commercialization of neighborhoods?
+train_data.select("space").sample(10)
+train_data.select("space").to_series().value_counts(sort=True)
+
+# could we extract this feature into something more meaningful?
+train_data.select("access").sample(10)
+train_data.select("access").to_series().value_counts(sort=True)
+
+# again same weirdness...now that im thinking about it, could it be just the same host (cross ref host_id with different listings)?
+train_data.select("interaction").sample(10)
+train_data.select("interaction").to_series().value_counts(sort=True)
+
+# could we extract key words bc there are ~130k rows with no nulls
+# create bins like walk, rideshare, bus, driver, etc
+train_data.select("transit").sample(10)
+train_data.select("transit").to_series().value_counts(sort=True)
+
+train_data.select("notes").sample(10)
+train_data.select("notes").to_series().value_counts(sort=True)
+
+# look into this more
+train_data.select("house_rules").sample(10)
+train_data.select("house_rules").to_series().value_counts(sort=True)
+
+# market
+train_data.select("city").sample(10)
+train_data.select("city").to_series().value_counts(sort=True)
+
+train_data.select("state").sample(10)
+train_data.select("state").to_series().value_counts(sort=True)
+
+train_data.select("zipcode").sample(10)
+train_data.select("zipcode").to_series().value_counts(sort=True)
+
+train_data.select("city").sample(10)
+train_data.select("city").to_series().value_counts(sort=True)
+
+train_data.select("guests_included").sample(10)
+train_data.select("guests_included").to_series().value_counts(sort=True)
+
+train_data.select("host_picture_url").sample(10)
+train_data.select("host_picture_url").to_series().value_counts(sort=True)
+# print 30 rows 
+print(train_data["host_picture_url"].sample(50))
+
+
+train_data.select("picture_url").sample(30)
+train_data.select("picture_url").to_series().value_counts(sort=True)
+
+train_data.select("thumbnail_url").sample(30)
+train_data.select("thumbnail_url").to_series().value_counts(sort=True)
+
+train_data.select("host_thumbnail_url").sample(30)
+train_data.select("host_thumbnail_url").to_series().value_counts(sort=True)
+
+train_data.select("medium_url").sample(30)
+train_data.select("medium_url").to_series().value_counts(sort=True)
+
+train_data.select("xl_picture_url").sample(30)
+train_data.select("xl_picture_url").to_series().value_counts(sort=True)
+
+# these features are suspect of being all null, sanity check to see % of null:
+# thumbnail_url, medium_url, xl_picture_url, host_thumbnail_url,
+# host_neighbourhood, neighbourhood_group_cleansed, country_code,
+# license, jurisdiction_names, experiences_offered, host_listing_count,
+# minimum_minimum_nights, maximum_minimum_nights, minimum_maximum_nights,
+# maximum_maximum_nights, minimum_nights_avg_ntm, maximum_nights_avg_ntm,
+# bathrooms_text, region_id, region_name, region_parent_id, region_parent_name
+null_candidates = [
+    "thumbnail_url", "medium_url", "xl_picture_url", "host_thumbnail_url",
+    "host_neighbourhood", "neighbourhood_group_cleansed", "country_code",
+    "license", "jurisdiction_names", "experiences_offered", "host_listing_count",
+    "minimum_minimum_nights", "maximum_minimum_nights", "minimum_maximum_nights",
+    "maximum_maximum_nights", "minimum_nights_avg_ntm", "maximum_nights_avg_ntm",
+    "bathrooms_text", "region_id", "region_name", "region_parent_id", "region_parent_name"
+]
+
+for col in null_candidates:
+    null_pct = train_data[col].null_count() / train_data.height * 100
+    print(f"{col}: {null_pct:.1f}% null")
+
+for col in null_candidates:
+    value_cnt = train_data[col].value_counts(sort=True)
+    print(f"{col}: {value_cnt}")
+
+# dont need any region, thumbnail/medium/xl url all 90.1% null. host_listing_count 99.8% null.
+
+
+other_candidates = [
+    "listing_url", "summary", "space", "neighborhood_overview", "notes", "transit", "access",   "interaction", "house_rules", "host_verifications", "host_has_profile_pic", "host_identity_verified", 
+    "require_guest_profile_picture", "require_guest_phone_verification", "is_business_travel_ready", "neighbourhood", "requires_license",
+]
+
+for col in other_candidates:
+    null_pct = train_data[col].null_count() / train_data.height * 100
+    print(f"{col}: {null_pct:.1f}% null")
+
+for col in other_candidates:
+    value_cnt = train_data[col].value_counts(sort=True)
+    print(f"{col}: {value_cnt}")
+# host_identity_verified could be worth adding (make null false), host_verification can be pulled to reduce 803 distinct values, 
+
+# option 1 - increase polars string display limit for this session
+pl.Config.set_fmt_str_lengths(300)
+train_data["host_verifications"].value_counts(sort=True)
+
+(
+    train_data.select(
+        pl.col("host_verifications")
+            .str.strip_chars("[]")
+            .str.split(", ")
+            .alias("v")
+    )
+    .explode("v")
+    .select(pl.col("v").str.strip_chars("'"))
+    .rename({"v": "verification"})
+    ["verification"]
+    .value_counts(sort=True)
+)
+
+
+# explore all of host_verifications to see what each verification type looks like and viewing hte entire column
+train_data.select("host_verifications").sample(10)
+```
+
+# feature engineering
+
+```{python regulatory-category}
+pat_commercial = r"(?i)hotel|hostel|bed and breakfast|\bresort\b"
+pl.col("property_type").str.contains(pat_commercial)
+
+pat_primary = r"(?i)apartment|condominium|condo|\bloft\b|serviced|rental unit|residential|entire home|entire place|\bfloor\b"
+pl.col("property_type").str.contains(pat_primary)
+
+
+def add_regulatory_features(df: pl.DataFrame) -> pl.DataFrame:
+    return (
+        df
+        .with_columns([
+            pl.when(
+                (pl.col("room_type") == "Hotel room") |
+                pl.col("property_type").str.contains(pat_commercial)
+            )
+            .then(pl.lit("commercial_type"))
+            .when(
+                (pl.col("room_type") == "Entire home/apt") &
+                pl.col("property_type").str.contains(pat_primary)
+            )
+            .then(pl.lit("entire_primary_likely"))
+            .when(pl.col("room_type") == "Entire home/apt")
+            .then(pl.lit("entire_nonstandard"))
+            .when(pl.col("room_type").is_in(["Private room", "Shared room"]))
+            .then(pl.lit("room_rental"))
+            .otherwise(pl.lit("other"))
+            .cast(pl.Categorical)
+            .alias("regulatory_category"),
+        ])
+        .with_columns([
+            (
+                (pl.col("regulatory_category") == "entire_primary_likely") &
+                (pl.col("minimum_nights") >= 30)
+            ).alias("min_nights_avoidance_flag"),
+
+            pl.when(
+                (pl.col("regulatory_category") == "entire_primary_likely") &
+                (pl.col("maximum_nights") == 365)
+            )
+            .then(pl.lit("cap_365"))
+            .when(
+                (pl.col("regulatory_category") == "entire_primary_likely") &
+                (pl.col("maximum_nights") == 1125)
+            )
+            .then(pl.lit("no_max_set"))
+            .otherwise(pl.lit("other"))
+            .cast(pl.Enum(["other", "cap_365", "no_max_set"]))
+            .alias("max_nights_risk_flag"),
+        ])
+    )
+
+train_clean = add_regulatory_features(train_clean)
+test_clean = add_regulatory_features(test_clean)
+```
+
+```{python amenities-parsing}
+from functools import reduce
+
+# Keywords per semantic bucket - each keyword contributes 1 to the bucket count
+_LUXURY_KW   = [r"\bpool\b", r"hot tub", r"jacuzzi", r"sauna", r"\bgym\b", r"fitness center",
+                r"doorman", r"fireplace", r"piano", r"billiard", r"game room", r"concierge"]
+_PRACTICAL_KW = [r"wifi", r"internet", r"wireless", r"kitchen", r"\bwasher\b", r"\bdryer\b",
+                 r"\bheating\b", r"air conditioning", r"refrigerator", r"microwave",
+                 r"dishwasher", r"\biron\b", r"hair dryer", r"coffee maker"]
+def _bucket_count(am_expr, keywords: list) -> pl.Expr:
+    flags = [am_expr.str.contains(kw).cast(pl.Int32) for kw in keywords]
+    return reduce(lambda a, b: a + b, flags)
+
+def parse_amenities(df: pl.DataFrame) -> pl.DataFrame:
+    am = pl.col("amenities").fill_null("").str.to_lowercase()
+    return df.with_columns([
+        _bucket_count(am, _LUXURY_KW).alias("amenity_luxury_count"),
+        _bucket_count(am, _PRACTICAL_KW).alias("amenity_practical_count"),
+    ])
+
+train_clean = parse_amenities(train_clean)
+test_clean  = parse_amenities(test_clean)
+```
+
+```{python host-quality-signals}
+def host_quality(df: pl.DataFrame) -> pl.DataFrame:
+    return df.with_columns([
+        (pl.col("host_total_listings_count").is_not_null() & (pl.col("host_total_listings_count") > 1))
+            .cast(pl.Int32).alias("is_multi_listing_host"),
+        pl.when(pl.col("host_about").is_null())
+            .then(0)
+            .otherwise(pl.col("host_about").str.split(" ").list.len())
+            .cast(pl.Float64).alias("host_experience_proxy"),
+        # encode response_time ordinal (faster = higher score) then add response_rate
+        # host_response_time is Categorical - cast to Utf8 before replacing
+        (
+            pl.col("host_response_rate").fill_null(0) +
+            pl.col("host_response_time").cast(pl.Utf8)
+              .replace({"within an hour": "25", "within a few hours": "15", "within a day": "5", "a few days or more": "0"})
+              .fill_null("0")
+              .cast(pl.Float64)
+        ).alias("response_score"),
+        # host_is_superhost is Categorical ("t"/"f") - cast to numeric before multiplying
+        (
+            pl.col("host_is_superhost").cast(pl.Utf8).str.contains("t").cast(pl.Float64) *
+            pl.col("host_response_rate").fill_null(0)
+        ).alias("host_reliability"),
+        # host_has_profile_picture
+        pl.col("host_picture_url").is_not_null().cast(pl.Int32).alias("host_has_profile_picture"),
+        # lower numeric user ID = older/more established account - log-scaled to prevent ID memorization
+        pl.col("host_picture_url")
+            .str.extract(r"/users/(\d+)/", 1)
+            .cast(pl.Float64)
+            .log(base=10)
+            .alias("host_account_age_proxy"),
+        # unix timestamp of profile pic upload - log-scaled to prevent memorization
+        pl.col("host_picture_url")
+            .str.extract(r"/profile_pic/(\d+)/", 1)
+            .cast(pl.Float64)
+            .log(base=10)
+            .alias("host_photo_timestamp"),
+        # legacy URL format = established older account vs newer UUID-based profile URLs
+        pl.col("host_picture_url")
+            .str.contains(r"/users/\d+/profile_pic/")
+            .cast(pl.Int32)
+            .alias("host_is_legacy_url"),
+
+    ])
+
+train_clean = host_quality(train_clean)
+test_clean  = host_quality(test_clean)
+```
+
+```{python complete-listings}
+#| eval: false
+def add_complete_listings(df: pl.DataFrame) -> pl.DataFrame:
+    return df.with_columns([
+        (
+            pl.col("accommodates").is_not_null() & (pl.col("accommodates") > 0) &
+            pl.col("bathrooms").is_not_null() & (pl.col("bathrooms") > 0) &
+            pl.col("bedrooms").is_not_null() & (pl.col("bedrooms") > 0) &
+            pl.col("beds").is_not_null() & (pl.col("beds") > 0) &
+            pl.col("bed_type").is_not_null() & (pl.col("bed_type").cast(pl.Utf8) != "N/A") &
+            pl.col("property_type").is_not_null() & (pl.col("property_type") != "N/A") & (pl.col("property_type") != "") &
+            pl.col("room_type").is_not_null() & (pl.col("room_type") != "N/A") & (pl.col("room_type") != "") &
+            pl.col("cancellation_policy").is_not_null() & (pl.col("cancellation_policy").cast(pl.Utf8) != "N/A") & (pl.col("cancellation_policy").cast(pl.Utf8) != "") &
+            pl.col("amenities").is_not_null() & (pl.col("amenities") != "") & (pl.col("amenities") != "0") &
+            pl.col("host_response_time").is_not_null() &
+            pl.col("host_response_rate").is_not_null() &
+            pl.col("name").is_not_null() & (pl.col("name") != "") &
+            pl.col("description").is_not_null() & (pl.col("description") != "")
+        ).cast(pl.Int32).alias("complete_listings")
+    ])
+
+train_clean = add_complete_listings(train_clean)
+test_clean  = add_complete_listings(test_clean)
+
+train_clean["complete_listings"].value_counts()
+```
+
+```{python impute-values}
+# has_property_details flag
+train_clean = train_clean.with_columns([
+    pl.when(pl.col("guests_included").is_null() | pl.col("bathrooms").is_null())
+        .then(0).otherwise(1).cast(pl.Int32).alias("has_property_details")
+])
+test_clean = test_clean.with_columns([
+    pl.when(pl.col("guests_included").is_null() | pl.col("bathrooms").is_null())
+        .then(0).otherwise(1).cast(pl.Int32).alias("has_property_details")
+])
+
+# bathrooms - impute with train median
+train_bathrooms_median = train_clean["bathrooms"].median()
+train_clean = train_clean.with_columns(pl.col("bathrooms").fill_null(train_bathrooms_median))
+test_clean  = test_clean.with_columns(pl.col("bathrooms").fill_null(train_bathrooms_median))
+
+# guests_included - impute 1
+train_clean = train_clean.with_columns(pl.col("guests_included").fill_null(1))
+test_clean  = test_clean.with_columns(pl.col("guests_included").fill_null(1))
+
+# beds - impute ceiling(accommodates / 2)
+train_clean = train_clean.with_columns(
+    pl.when(pl.col("beds").is_null())
+        .then((pl.col("accommodates").cast(pl.Float64) / 2).ceil())
+        .otherwise(pl.col("beds")).alias("beds")
+)
+test_clean = test_clean.with_columns(
+    pl.when(pl.col("beds").is_null())
+        .then((pl.col("accommodates").cast(pl.Float64) / 2).ceil())
+        .otherwise(pl.col("beds")).alias("beds")
+)
+
+# bedrooms - NA = studio = 0
+train_clean = train_clean.with_columns(pl.col("bedrooms").fill_null(0).cast(pl.Int32))
+test_clean  = test_clean.with_columns(pl.col("bedrooms").fill_null(0).cast(pl.Int32))
+
+# remove bedroom outliers from train; cap test
+train_clean = train_clean.filter(pl.col("bedrooms") <= 10)
+test_clean  = test_clean.with_columns(pl.col("bedrooms").clip(upper_bound=10))
+
+# extra_people, security_deposit, cleaning_fee - impute 0
+for col in ["extra_people", "security_deposit", "cleaning_fee"]:
+    train_clean = train_clean.with_columns(pl.col(col).fill_null(0))
+    test_clean  = test_clean.with_columns(pl.col(col).fill_null(0))
+
+# reviews_per_month - impute 0
+train_clean = train_clean.with_columns(pl.col("reviews_per_month").fill_null(0))
+test_clean  = test_clean.with_columns(pl.col("reviews_per_month").fill_null(0))
+
+# has_reviews flag
+train_clean = train_clean.with_columns(
+    pl.when(pl.col("review_scores_rating").is_null()).then(0).otherwise(1).cast(pl.Int32).alias("has_reviews")
+)
+test_clean = test_clean.with_columns(
+    pl.when(pl.col("review_scores_rating").is_null()).then(0).otherwise(1).cast(pl.Int32).alias("has_reviews")
+)
+
+# review sub-score imputation - impute 10 where p25 == 10
+review_sub_cols = [
+    "review_scores_accuracy", "review_scores_cleanliness",
+    "review_scores_checkin",  "review_scores_communication",
+    "review_scores_location",  "review_scores_value"
+]
+
+p25_vals = {col: train_clean[col].quantile(0.25) for col in review_sub_cols}
+print(p25_vals)
+
+for col, p25 in p25_vals.items():
+    if p25 == 10:
+        for df_name, df in [("train", train_clean), ("test", test_clean)]:
+            updated = df.with_columns(
+                pl.when((pl.col("has_reviews") == 1) & pl.col(col).is_null())
+                    .then(10.0).otherwise(pl.col(col)).alias(col)
+            )
+            if df_name == "train":
+                train_clean = updated
+            else:
+                test_clean = updated
+
+# categorize review sub-scores: 0 = no reviews, 1 = <10, 2 = ==10
+def cat_review_expr(col_name: str) -> pl.Expr:
+    return (
+        pl.when((pl.col("has_reviews") == 0) | pl.col(col_name).is_null())
+            .then(0)
+            .when(pl.col(col_name) < 10)
+            .then(1)
+            .otherwise(2)
+            .cast(pl.Int32)
+            .alias(col_name)
+    )
+
+train_clean = train_clean.with_columns([cat_review_expr(c) for c in review_sub_cols])
+test_clean  = test_clean.with_columns([cat_review_expr(c) for c in review_sub_cols])
+```
+
+```{python host-response-imputation}
+# empirical means from non-null train rows, grouped by recoded comm score (0/1/2)
+_COMM_IMPUTE = {0: 90.0, 1: 95.0, 2: 96.0}
+
+def impute_and_bucket_response_rate(df: pl.DataFrame, comm_map: dict = _COMM_IMPUTE) -> pl.DataFrame:
+    return (
+        df
+        .with_columns([
+            pl.col("host_response_rate").is_null().cast(pl.Int32).alias("host_response_rate_missing"),
+            pl.when(pl.col("host_response_rate").is_not_null())
+                .then(pl.col("host_response_rate"))
+                .when(pl.col("host_is_superhost").cast(pl.Utf8) == "TRUE")
+                .then(pl.lit(98.0))
+                .when(pl.col("review_scores_communication") == 0)
+                .then(pl.lit(comm_map[0]))
+                .when(pl.col("review_scores_communication") == 1)
+                .then(pl.lit(comm_map[1]))
+                .otherwise(pl.lit(comm_map[2]))
+                .alias("host_response_rate"),
+        ])
+        .with_columns(
+            pl.when(pl.col("host_response_rate") >= 100)
+                .then(pl.lit("perfect"))
+                .when(pl.col("host_response_rate") >= 90)
+                .then(pl.lit("near_perfect"))
+                .otherwise(pl.lit("underperforming"))
+                .cast(pl.Categorical)
+                .alias("host_response_tier")
+        )
+    )
+
+train_clean = impute_and_bucket_response_rate(train_clean)
+test_clean  = impute_and_bucket_response_rate(test_clean)
+
+print("Response tier distribution (train):")
+print(train_clean["host_response_tier"].value_counts(sort=True))
+print("\nMissing flag:")
+print(train_clean["host_response_rate_missing"].value_counts())
+```
+
+```{python host-acceptance-imputation}
+# --- diagnostic: understand the null pattern before imputing ---
+_acc_nonnull = train_clean.filter(pl.col("host_acceptance_rate").is_not_null())
+
+print("=== Null rate by instant_bookable ===")
+print(train_clean.group_by("instant_bookable").agg(
+    (pl.col("host_acceptance_rate").is_null().cast(pl.Int32).mean() * 100).alias("pct_null"),
+    pl.len().alias("n"),
+).sort("instant_bookable"))
+
+print("\n=== Mean acceptance rate by superhost (non-null rows) ===")
+print(_acc_nonnull.group_by("host_is_superhost").agg(
+    pl.col("host_acceptance_rate").mean().alias("mean_acceptance_rate"),
+    pl.len().alias("n"),
+).sort("host_is_superhost"))
+
+print("\n=== Booking rate: null vs non-null acceptance rate ===")
+print(train_clean.with_columns(
+    pl.col("host_acceptance_rate").is_null().alias("acc_is_null")
+).group_by("acc_is_null").agg(
+    pl.col("high_booking").cast(pl.Int32).mean().alias("booking_rate"),
+    pl.len().alias("n"),
+).sort("acc_is_null"))
+
+# --- imputation (update constants from diagnostic output above) ---
+_ACC_SUPERHOST_MEAN = 91.9   # empirical mean of non-null superhost rows
+_ACC_OTHER_MEAN     = 84.3   # empirical mean of non-null non-superhost rows
+
+def impute_acceptance_rate(df: pl.DataFrame,
+                           superhost_mean: float = _ACC_SUPERHOST_MEAN,
+                           other_mean: float = _ACC_OTHER_MEAN) -> pl.DataFrame:
+    return df.with_columns([
+        pl.col("host_acceptance_rate").is_null().cast(pl.Int32)
+          .alias("host_acceptance_rate_missing"),
+        pl.when(pl.col("host_acceptance_rate").is_not_null())
+          .then(pl.col("host_acceptance_rate"))
+          .when(
+              pl.col("instant_bookable").cast(pl.Utf8).str.to_lowercase()
+                .str.contains("t")
+          )
+          .then(pl.lit(100.0))
+          .when(pl.col("host_is_superhost").cast(pl.Utf8) == "TRUE")
+          .then(pl.lit(superhost_mean))
+          .otherwise(pl.lit(other_mean))
+          .alias("host_acceptance_rate"),
+    ])
+
+train_clean = impute_acceptance_rate(train_clean)
+test_clean  = impute_acceptance_rate(test_clean)
+```
+
+```{python pricing-signals}
+# shrinkage only to sparse neighbourhoods
+LAMBDA = 30  # shrinkage strength; tune between 10–50
+
+_global_median_price: float = float(train_clean["price"].median())
+
+_nbhd_agg = (
+    train_clean
+    .group_by("neighbourhood_cleansed")
+    .agg([
+        pl.col("price").median().alias("raw_median"),
+        pl.col("price").count().alias("n")
+    ])
+    .with_columns([
+        ((pl.col("n") * pl.col("raw_median") + LAMBDA * _global_median_price)
+         / (pl.col("n") + LAMBDA))
+            .alias("smoothed_median")
+    ])
+)
+
+_nbhd_median = dict(zip(
+    _nbhd_agg["neighbourhood_cleansed"].to_list(),
+    _nbhd_agg["smoothed_median"].to_list()
+))
+
+# OOF smoothed target encoding for neighbourhood booking rate
+# Each training row's rate is computed from the other 4 folds only - no leakage.
+# Test rows use the full-training smoothed rate (safe: test labels are unknown).
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import StratifiedKFold
+
+K_BOOKING = 200
+
+_global_booking_rate = float(
+    train_clean["high_booking"].cast(pl.Utf8).cast(pl.Int32).mean()
+)
+
+_nbhd_arr = train_clean["neighbourhood_cleansed"].cast(pl.Utf8).to_numpy()
+_hb_arr   = train_clean["high_booking"].cast(pl.Utf8).cast(pl.Int32).to_numpy()
+_n_train  = len(_nbhd_arr)
+_oof_rate = np.full(_n_train, _global_booking_rate, dtype=float)
+
+_skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+for _tr_idx, _val_idx in _skf.split(np.zeros(_n_train), _hb_arr):
+    _fold_df  = pd.DataFrame({"nbhd": _nbhd_arr[_tr_idx], "hb": _hb_arr[_tr_idx].astype(float)})
+    _fold_agg = _fold_df.groupby("nbhd")["hb"].agg(["sum", "count"])
+    _fold_agg["rate"] = (_fold_agg["sum"] + K_BOOKING * _global_booking_rate) / (_fold_agg["count"] + K_BOOKING)
+    _fold_map = _fold_agg["rate"].to_dict()
+    _oof_rate[_val_idx] = pd.Series(_nbhd_arr[_val_idx]).map(_fold_map).fillna(_global_booking_rate).values
+
+# full-training smoothed rate - used for test and for nbhd_listing_count
+_nbhd_booking_agg = (
+    train_clean
+    .with_columns(pl.col("high_booking").cast(pl.Utf8).cast(pl.Int32).alias("_hb_int"))
+    .group_by("neighbourhood_cleansed")
+    .agg([
+        pl.col("_hb_int").sum().alias("nbhd_hb_sum"),
+        pl.col("_hb_int").count().alias("nbhd_n"),
+    ])
+    .with_columns([
+        ((pl.col("nbhd_hb_sum") + K_BOOKING * _global_booking_rate)
+         / (pl.col("nbhd_n") + K_BOOKING))
+        .alias("nbhd_booking_rate"),
+        pl.col("nbhd_n").alias("nbhd_listing_count"),
+    ])
+)
+_nbhd_booking_map = dict(zip(
+    _nbhd_booking_agg["neighbourhood_cleansed"].to_list(),
+    _nbhd_booking_agg["nbhd_booking_rate"].to_list()
+))
+_nbhd_count_map = dict(zip(
+    _nbhd_booking_agg["neighbourhood_cleansed"].to_list(),
+    _nbhd_booking_agg["nbhd_listing_count"].to_list()
+))
+
+train_clean = train_clean.with_columns([
+    pl.Series("nbhd_booking_rate", _oof_rate),
+    pl.col("neighbourhood_cleansed").cast(pl.Utf8)
+      .replace_strict(_nbhd_count_map, default=0)
+      .cast(pl.Float64).alias("nbhd_listing_count"),
+])
+test_clean = test_clean.with_columns([
+    pl.col("neighbourhood_cleansed").cast(pl.Utf8)
+      .replace_strict(_nbhd_booking_map, default=_global_booking_rate)
+      .cast(pl.Float64).alias("nbhd_booking_rate"),
+    pl.col("neighbourhood_cleansed").cast(pl.Utf8)
+      .replace_strict(_nbhd_count_map, default=0)
+      .cast(pl.Float64).alias("nbhd_listing_count"),
+])
+
+def pricing_signals(df: pl.DataFrame) -> pl.DataFrame:
+    return df.with_columns([
+        (pl.col("price") + pl.col("cleaning_fee").fill_null(0) + pl.col("security_deposit").fill_null(0))
+            .alias("total_cost"),
+        (pl.col("cleaning_fee").fill_null(0) / pl.col("price").clip(lower_bound=1))
+            .alias("cleaning_fee_ratio"),
+        # price relative to neighbourhood median (computed from train only)
+        # unseen test neighbourhoods fall back to global training median
+        (pl.col("price") / pl.col("neighbourhood_cleansed").cast(pl.Utf8)
+            .replace_strict(_nbhd_median, default=None)
+            .cast(pl.Float64)
+            .fill_null(_global_median_price))
+            .alias("price_vs_neighbourhood_median"),
+        (pl.col("price") / pl.col("bedrooms").fill_null(1).clip(lower_bound=1))
+            .alias("price_per_bedroom"),
+        (pl.col("cleaning_fee").fill_null(0) / pl.col("minimum_nights").clip(lower_bound=1))
+            .alias("cleaning_fee_per_night"),
+    ])
+
+train_clean = pricing_signals(train_clean)
+test_clean  = pricing_signals(test_clean)
+
+def pricing_strategy(df: pl.DataFrame) -> pl.DataFrame:
+    return df.with_columns([
+        # ratio < 1.0 = host discounts for longer stays (motivated to fill calendar)
+        # null = host hasn't set weekly/monthly pricing at all
+        (pl.col("weekly_price") / 7.0 / pl.col("price").clip(lower_bound=1))
+            .alias("weekly_rate_ratio"),
+        (pl.col("monthly_price") / 30.0 / pl.col("price").clip(lower_bound=1))
+            .alias("monthly_rate_ratio"),
+        pl.col("weekly_price").is_not_null().cast(pl.Int32).alias("has_weekly_pricing"),
+        pl.col("monthly_price").is_not_null().cast(pl.Int32).alias("has_monthly_pricing"),
+    ])
+
+train_clean = pricing_strategy(train_clean)
+test_clean  = pricing_strategy(test_clean)
+
+## -- Cardinality check -- ##
+nbhd_counts = (
+    train_clean
+    .group_by("neighbourhood_cleansed")
+    .agg(pl.col("price").count().alias("n"))
+    .sort("n", descending=False)  # sparse ones first
+)
+print(nbhd_counts)
+
+train_nbhds = set(train_clean["neighbourhood_cleansed"].unique().to_list())
+test_nbhds  = set(test_clean["neighbourhood_cleansed"].unique().to_list())
+
+print(f"Train unique neighbourhoods: {len(train_nbhds)}")
+print(f"Test unique neighbourhoods:  {len(test_nbhds)}")
+print(f"In test but NOT in train:    {len(test_nbhds - train_nbhds)}")  # will hit your fallback
+print(f"In train but NOT in test:    {len(train_nbhds - test_nbhds)}")  # wasted aggregates
+
+# How many of the 993 test neighbourhoods have thin train coverage?
+nbhd_counts = (
+    train_clean
+    .group_by("neighbourhood_cleansed")
+    .agg(pl.col("price").count().alias("n"))
+    .with_columns(pl.col("neighbourhood_cleansed").cast(pl.Utf8))
+)
+test_nbhds_df = pl.DataFrame({"neighbourhood_cleansed": list(test_nbhds)})
+test_nbhds_coverage = test_nbhds_df.join(nbhd_counts, on="neighbourhood_cleansed", how="left").sort("n")
+test_nbhds_coverage
+
+thresholds = [10, 30, 50]
+for t in thresholds:
+    below = test_nbhds_coverage.filter(
+        pl.col("n").is_null() | (pl.col("n") < t)
+    ).height
+    print(f"< {t} rows (or unseen): {below} / 993 test neighbourhoods ({below/993*100:.1f}%)")
+```
+
+```{python listing-options}
+def count_photos(df: pl.DataFrame) -> pl.DataFrame:
+    return df.with_columns([
+        # log-scaled listing ID - lower = older/more established listing (compressed to prevent memorization)
+        pl.col("listing_url")
+            .str.extract(r"/rooms/(\d+)", 1)
+            .cast(pl.Float64)
+            .log(base=10)
+            .alias("listing_id_proxy"),
+        pl.col("picture_url").is_not_null().cast(pl.Int32).alias("has_photo"),
+        # _original in filename = older photo upload style
+        pl.col("picture_url")
+            .str.contains(r"_original")
+            .cast(pl.Int32)
+            .alias("listing_photo_has_original"),
+        # URL generation as categorical - encodes listing era without using quasi-unique IDs
+        # priority order matters: check most specific patterns first
+        pl.when(pl.col("picture_url").is_null())
+            .then(pl.lit("null"))
+        .when(pl.col("picture_url").str.contains(r"miso/Hosting-"))
+            .then(pl.lit("miso"))
+        .when(pl.col("picture_url").str.contains(r"/ic/pictures/"))
+            .then(pl.lit("ic_legacy"))
+        .when(pl.col("picture_url").str.contains(r"/im/pictures/\d+/"))
+            .then(pl.lit("old_numeric"))
+        .when(pl.col("picture_url").str.contains(r"/im/pictures/"))
+            .then(pl.lit("old_uuid"))
+        .when(pl.col("picture_url").str.contains(r"/pictures/"))
+            .then(pl.lit("new_plain"))
+        .otherwise(pl.lit("old_uuid"))
+        .cast(pl.Categorical)
+        .alias("picture_url_format"),
+    ])
+
+train_clean = count_photos(train_clean)
+test_clean = count_photos(test_clean)
+
+```
+
+```{python photo-quality}
+#| eval: false
+def add_photo_quality(df: pl.DataFrame) -> pl.DataFrame:
+    pic = pl.col("picture_url").fill_null("")
+    return df.with_columns([
+        pic.str.contains(r"\.png").cast(pl.Int32).alias("is_png"),
+        pic.str.contains(r"\?t=r:").cast(pl.Int32).alias("uses_modern_image_service"),
+    ])
+
+train_clean = add_photo_quality(train_clean)
+test_clean  = add_photo_quality(test_clean)
+```
+
+```{python validate-photo-features}
+#| eval: false
+for f in ["is_png", "uses_modern_image_service"]:
+    print(train_clean.group_by(f).agg(
+        pl.col("high_booking").cast(pl.Int32).mean().alias("booking_rate"),
+        pl.len().alias("n"),
+    ).sort(f))
+```
+
+```{python dynamic-pricing-features}
+def add_dynamic_pricing(df: pl.DataFrame) -> pl.DataFrame:
+    price = pl.col("price")
+
+    weekly_discount_pct = (
+        pl.when(pl.col("weekly_price").is_not_null() & (price > 0) &
+                (pl.col("weekly_price") < price * 7))
+            .then((price * 7 - pl.col("weekly_price")) / (price * 7) * 100)
+            .otherwise(0.0)
+    )
+
+    monthly_discount_pct = (
+        pl.when(pl.col("monthly_price").is_not_null() & (price > 0) &
+                (pl.col("monthly_price") < price * 30))
+            .then((price * 30 - pl.col("monthly_price")) / (price * 30) * 100)
+            .otherwise(0.0)
+    )
+
+    # absolute price tier - budget/mid/premium/luxury
+    price_tier = (
+        pl.when(price < 50).then(pl.lit("budget"))
+          .when(price < 100).then(pl.lit("mid"))
+          .when(price < 200).then(pl.lit("premium"))
+          .otherwise(pl.lit("luxury"))
+          .cast(pl.Categorical)
+    )
+
+    # cleaning fee as fraction of nightly price - high ratio = anchoring strategy
+    cleaning_fee_ratio = (
+        pl.when(pl.col("cleaning_fee").is_not_null() & (price > 0))
+            .then(pl.col("cleaning_fee") / price)
+            .otherwise(0.0)
+    )
+
+    return df.with_columns([
+        weekly_discount_pct.alias("weekly_discount_pct"),
+        monthly_discount_pct.alias("monthly_discount_pct"),
+        price_tier.alias("price_tier"),
+        cleaning_fee_ratio.alias("cleaning_fee_ratio"),
+    ])
+
+train_clean = add_dynamic_pricing(train_clean)
+test_clean  = add_dynamic_pricing(test_clean)
+```
+
+```{python description-amenity-features}
+_DESC_LUXURY_KW   = [r"rooftop", r"jacuzzi", r"hot tub", r"\bpool\b", r"panoramic",
+                     r"ocean.?view", r"mountain.?view", r"waterfront", r"penthouse",
+                     r"infinity pool", r"private terrace", r"wine cellar", r"sauna"]
+_DESC_LOCATION_KW = [r"\bbeach\b", r"beachfront", r"lakefront", r"lake view",
+                     r"city view", r"park view", r"walking distance", r"steps from"]
+_DESC_AMENITY_KW  = [r"free parking", r"parking included", r"garage", r"ev charger",
+                     r"coffee maker", r"espresso", r"record player", r"board games"]
+
+def add_description_amenities(df: pl.DataFrame) -> pl.DataFrame:
+    desc = pl.col("description").fill_null("").str.to_lowercase()
+    name = pl.col("name").fill_null("").str.to_lowercase()
+    combined = (pl.col("description").fill_null("") + " " + pl.col("name").fill_null("")).str.to_lowercase()
+
+    desc_luxury = reduce(lambda a, b: a + b,
+                         [desc.str.contains(kw).cast(pl.Int32) for kw in _DESC_LUXURY_KW])
+    desc_location = reduce(lambda a, b: a + b,
+                           [desc.str.contains(kw).cast(pl.Int32) for kw in _DESC_LOCATION_KW])
+    desc_amenity = reduce(lambda a, b: a + b,
+                          [desc.str.contains(kw).cast(pl.Int32) for kw in _DESC_AMENITY_KW])
+
+    # luxury signal combining both amenities field and description
+    name_luxury = name.str.contains(
+        r"rooftop|luxury|penthouse|ocean.?view|beach|resort|panoramic|infinity|designer"
+    ).cast(pl.Int32)
+
+    return df.with_columns([
+        desc_luxury.alias("desc_luxury_count"),
+        desc_location.alias("desc_location_count"),
+        desc_amenity.alias("desc_bonus_amenity_count"),
+        name_luxury.alias("has_luxury_name_keyword"),
+    ])
+
+train_clean = add_description_amenities(train_clean)
+test_clean  = add_description_amenities(test_clean)
+```
+
+```{python imputation-check-typing}
+# price cap at 99th percentile
+price_cap = train_clean["price"].quantile(0.99)
+train_clean = train_clean.filter((pl.col("price") > 0) & (pl.col("price") <= price_cap))
+test_clean = test_clean.with_columns([
+    pl.col("price").clip(lower_bound=1, upper_bound=price_cap),
+    (pl.col("price").clip(lower_bound=1, upper_bound=price_cap) / pl.col("accommodates").cast(pl.Float64).clip(lower_bound=1))
+        .alias("price_per_person"),
+])
+
+# zipcode - keep only zipcodes covering >= 0.1% of listings
+zip_counts = train_clean.with_columns(pl.col("zipcode").cast(pl.Utf8))["zipcode"].value_counts()
+total = train_clean.height
+valid_zips = zip_counts.filter(pl.col("count") >= total * 0.001)["zipcode"].to_list()
+
+train_clean = train_clean.with_columns(
+    pl.when(pl.col("zipcode").cast(pl.Utf8).is_in(valid_zips))
+        .then(pl.col("zipcode").cast(pl.Utf8))
+        .otherwise(pl.lit("other"))
+        .cast(pl.Categorical).alias("zipcode")
+)
+test_clean = test_clean.with_columns(
+    pl.when(pl.col("zipcode").cast(pl.Utf8).is_in(valid_zips))
+        .then(pl.col("zipcode").cast(pl.Utf8))
+        .otherwise(pl.lit("other"))
+        .cast(pl.Categorical).alias("zipcode")
+)
+
+# city - lump sparse cities (< 0.1% of listings) to "other"
+city_counts = train_clean.with_columns(pl.col("city").cast(pl.Utf8))["city"].value_counts()
+valid_cities = city_counts.filter(pl.col("count") >= total * 0.001)["city"].to_list()
+
+train_clean = train_clean.with_columns(
+    pl.when(pl.col("city").cast(pl.Utf8).is_in(valid_cities))
+        .then(pl.col("city").cast(pl.Utf8))
+        .otherwise(pl.lit("other"))
+        .cast(pl.Categorical).alias("city")
+)
+test_clean = test_clean.with_columns(
+    pl.when(pl.col("city").cast(pl.Utf8).is_in(valid_cities))
+        .then(pl.col("city").cast(pl.Utf8))
+        .otherwise(pl.lit("other"))
+        .cast(pl.Categorical).alias("city")
+)
+# print city_counts
+print(train_clean["city"].value_counts())
+
+## -- Cardinality check -- ##
+zip_counts = (
+    train_clean
+    .group_by("zipcode")
+    .agg(pl.col("price").count().alias("n"))
+    .sort("n", descending=False)  # sparse ones first
+)
+print(zip_counts)
+
+train_zips = set(v for v in train_clean["zipcode"].unique().to_list() if v is not None)
+test_zips  = set(v for v in test_clean["zipcode"].unique().to_list()  if v is not None)
+
+print(f"Train unique zipcodes: {len(train_zips)}")
+print(f"Test unique zipcodes:  {len(test_zips)}")
+print(f"In test but NOT in train:    {len(test_zips - train_zips)}")  # will hit your fallback
+print(f"In train but NOT in test:    {len(train_zips - test_zips)}")  # wasted aggregates
+
+# How many of the test zipcodes have thin train coverage?
+zip_counts = (
+    train_clean
+    .group_by("zipcode")
+    .agg(pl.col("price").count().alias("n"))
+    .with_columns(pl.col("zipcode").cast(pl.Utf8))
+)
+test_zips_df = pl.DataFrame({"zipcode": list(test_zips)})
+test_zips_coverage = test_zips_df.join(zip_counts, on="zipcode", how="left").sort("n")
+test_zips_coverage
+
+thresholds = [10, 30, 50]
+for t in thresholds:
+    below = test_zips_coverage.filter(
+        pl.col("n").is_null() | (pl.col("n") < t)
+    ).height
+    print(f"< {t} rows (or unseen): {below} / {len(test_zips)} test zipcodes ({below/len(test_zips)*100:.1f}%)")
+
+
+
+
+
+# description_length
+train_clean = train_clean.with_columns(
+    pl.col("description").fill_null("").str.len_chars().cast(pl.Float64).alias("description_length")
+)
+test_clean = test_clean.with_columns(
+    pl.col("description").fill_null("").str.len_chars().cast(pl.Float64).alias("description_length")
+)
+```
+
+```{python neighbourhood-signals}
+# all three aggregates computed from train only - applied to both train and test
+_nbhd_rpm_agg    = train_clean.group_by("neighbourhood_cleansed").agg(pl.col("reviews_per_month").median())
+_nbhd_rpm        = dict(zip(_nbhd_rpm_agg["neighbourhood_cleansed"].to_list(), _nbhd_rpm_agg["reviews_per_month"].to_list()))
+_global_rpm      = float(train_clean["reviews_per_month"].median())
+
+_nbhd_rating_agg = train_clean.group_by("neighbourhood_cleansed").agg(pl.col("review_scores_rating").median())
+_nbhd_rating     = dict(zip(_nbhd_rating_agg["neighbourhood_cleansed"].to_list(), _nbhd_rating_agg["review_scores_rating"].to_list()))
+_global_rating   = float(train_clean["review_scores_rating"].median())
+
+_nbhd_price_agg  = train_clean.group_by("neighbourhood_cleansed").agg(pl.col("price").median())
+_nbhd_price      = dict(zip(_nbhd_price_agg["neighbourhood_cleansed"].to_list(), _nbhd_price_agg["price"].to_list()))
+_global_nbhd_price = float(train_clean["price"].median())
+
+_nbhd_acc_agg    = train_clean.group_by("neighbourhood_cleansed").agg(pl.col("accommodates").median())
+_nbhd_acc        = dict(zip(_nbhd_acc_agg["neighbourhood_cleansed"].to_list(), _nbhd_acc_agg["accommodates"].to_list()))
+_global_nbhd_acc = float(train_clean["accommodates"].median())
+
+def neighbourhood_signals(df: pl.DataFrame) -> pl.DataFrame:
+    return df.with_columns([
+        pl.col("neighbourhood_cleansed").cast(pl.Utf8)
+            .replace_strict(_nbhd_rpm, default=None).cast(pl.Float64).fill_null(_global_rpm)
+            .alias("nbhd_median_reviews_per_month"),
+        pl.col("neighbourhood_cleansed").cast(pl.Utf8)
+            .replace_strict(_nbhd_rating, default=None).cast(pl.Float64).fill_null(_global_rating)
+            .alias("nbhd_median_review_score"),
+        pl.col("neighbourhood_cleansed").cast(pl.Utf8)
+            .replace_strict(_nbhd_price, default=None).cast(pl.Float64).fill_null(_global_nbhd_price)
+            .alias("nbhd_median_price"),
+        pl.col("neighbourhood_cleansed").cast(pl.Utf8)
+            .replace_strict(_nbhd_acc, default=None).cast(pl.Float64).fill_null(_global_nbhd_acc)
+            .alias("nbhd_median_accommodates"),
+    ])
+
+train_clean = neighbourhood_signals(train_clean)
+test_clean  = neighbourhood_signals(test_clean)
+```
+
+```{python host-trust-signals}
+def host_trust_signals(df: pl.DataFrame) -> pl.DataFrame:
+    return df.with_columns([
+        # null means not verified - treat as FALSE
+        pl.col("host_identity_verified")
+            .cast(pl.Utf8)
+            .str.to_lowercase()
+            .str.contains("true")
+            .fill_null(False)
+            .cast(pl.Int32)
+            .alias("host_identity_verified"),
+        # null means market doesn't require it - treat as FALSE
+        pl.col("requires_license")
+            .cast(pl.Utf8)
+            .str.to_lowercase()
+            .str.contains("true")
+            .fill_null(False)
+            .cast(pl.Int32)
+            .alias("requires_license"),
+    ])
+
+train_clean = host_trust_signals(train_clean)
+test_clean  = host_trust_signals(test_clean)
+```
+
+```{python host-verification-signals}
+def host_verification_signals(df: pl.DataFrame) -> pl.DataFrame:
+    return df.with_columns([
+        # total number of verifications - proxy for trust tier
+        pl.col("host_verifications")
+            .str.count_matches(r"'[^']+'")
+            .fill_null(0)
+            .cast(pl.Int32)
+            .alias("verification_count"),
+        # platform has confirmed host has prior reviews - social proof
+        pl.col("host_verifications")
+            .str.contains("'reviews'")
+            .fill_null(False)
+            .cast(pl.Int32)
+            .alias("has_reviews_verification"),
+        # government_id catches both government_id and offline_government_id
+        pl.col("host_verifications")
+            .str.contains("government_id")
+            .fill_null(False)
+            .cast(pl.Int32)
+            .alias("has_id_verification"),
+    ])
+
+train_clean = host_verification_signals(train_clean)
+test_clean  = host_verification_signals(test_clean)
+```
+
+```{python text-effort-signals}
+def text_effort_signals(df: pl.DataFrame) -> pl.DataFrame:
+    return df.with_columns([
+        pl.col("summary").is_not_null().cast(pl.Int32).alias("has_summary"),
+        pl.col("summary").fill_null("").str.len_chars().cast(pl.Float64).alias("summary_length"),
+        pl.col("neighborhood_overview").is_not_null().cast(pl.Int32).alias("has_neighborhood_overview"),
+        pl.col("neighborhood_overview").fill_null("").str.len_chars().cast(pl.Float64).alias("neighborhood_overview_length"),
+        pl.col("house_rules").is_not_null().cast(pl.Int32).alias("has_house_rules"),
+        pl.col("transit").is_not_null().cast(pl.Int32).alias("has_transit_info"),
+        # shared bath = fundamentally different guest experience vs private/standard bath
+        pl.col("bathrooms_text")
+            .str.contains("shared")
+            .fill_null(False)
+            .cast(pl.Int32)
+            .alias("has_shared_bath"),
+        pl.col("name").fill_null("").str.len_chars().cast(pl.Float64).alias("name_length"),
+        pl.col("house_rules").fill_null("").str.len_chars().cast(pl.Float64).alias("house_rules_length"),
+    ])
+
+train_clean = text_effort_signals(train_clean)
+test_clean  = text_effort_signals(test_clean)
+```
+
+```{python license-signals}
+#| eval: false
+def license_signals(df: pl.DataFrame) -> pl.DataFrame:
+    lic = pl.col("license").cast(pl.Utf8).str.to_lowercase()
+    return df.with_columns([
+        pl.col("license").is_not_null().cast(pl.Int32).alias("has_license"),
+        lic.str.contains("pending").fill_null(False).cast(pl.Int32).alias("license_is_pending"),
+        lic.str.contains("exempt").fill_null(False).cast(pl.Int32).alias("license_is_exempt"),
+        # registered = has a real license number, not pending and not exempt
+        (
+            pl.col("license").is_not_null() &
+            ~lic.str.contains("pending") &
+            ~lic.str.contains("exempt")
+        ).cast(pl.Int32).alias("license_is_registered"),
+    ])
+
+train_clean = license_signals(train_clean)
+test_clean  = license_signals(test_clean)
+train_clean.write_csv("train_clean_for_r.csv")
+```
+
+```{python conversion-rate-features}
+def add_conversion_features(df: pl.DataFrame) -> pl.DataFrame:
+    # listing completeness score: count of non-null text sections (0–9)
+    _text_cols = ["name", "summary", "description", "space", "neighborhood_overview",
+                  "transit", "access", "interaction", "house_rules"]
+    completeness = reduce(
+        lambda a, b: a + b,
+        [pl.col(c).is_not_null().cast(pl.Int32) for c in _text_cols]
+    )
+
+    # security deposit signals
+    has_deposit = (pl.col("security_deposit").is_not_null() & (pl.col("security_deposit") > 0))
+    deposit_per_night = (
+        pl.when(has_deposit & (pl.col("price") > 0))
+            .then(pl.col("security_deposit") / pl.col("price"))
+            .otherwise(0.0)
+    )
+
+    # discount flags - replace the broken monthly_rate_ratio (343k nulls)
+    has_weekly_discount = (
+        pl.col("weekly_price").is_not_null() &
+        (pl.col("price") > 0) &
+        (pl.col("weekly_price") < pl.col("price") * 7)
+    ).cast(pl.Int32)
+
+    has_monthly_discount = (
+        pl.col("monthly_price").is_not_null() &
+        (pl.col("price") > 0) &
+        (pl.col("monthly_price") < pl.col("price") * 30)
+    ).cast(pl.Int32)
+
+    # generosity of base price before extra-person charges kick in
+    guests_included_ratio = (
+        pl.when(pl.col("accommodates") > 0)
+            .then(pl.col("guests_included").cast(pl.Float64) / pl.col("accommodates"))
+            .otherwise(0.0)
+    )
+
+    # booking friction and market-segment signals
+    def _bool_flag(col: str) -> pl.Expr:
+        return (
+            pl.col(col).fill_null("f").cast(pl.Utf8).str.to_lowercase()
+              .str.contains("t").cast(pl.Int32).alias(col)
+        )
+
+    return df.with_columns([
+        completeness.alias("listing_completeness_score"),
+        has_deposit.cast(pl.Int32).alias("has_security_deposit"),
+        deposit_per_night.alias("security_deposit_per_night"),
+        has_weekly_discount.alias("has_weekly_discount"),
+        has_monthly_discount.alias("has_monthly_discount"),
+        guests_included_ratio.alias("guests_included_ratio"),
+        _bool_flag("require_guest_profile_picture"),
+        _bool_flag("require_guest_phone_verification"),
+        _bool_flag("is_business_travel_ready"),
+    ])
+
+train_clean = add_conversion_features(train_clean)
+test_clean  = add_conversion_features(test_clean)
+```
+
+
+# modeling
+
+```{python prepare-text}
+_TEXT_COLS = ["description", "summary", "space", "transit", "neighborhood_overview", "house_rules"]
+
+def _combine_listing_text(df: pl.DataFrame) -> list:
+    return [
+        " ".join(filter(None, [r[c] for c in _TEXT_COLS]))
+        for r in df[_TEXT_COLS].fill_null("").to_dicts()
+    ]
+
+train_text_raw = _combine_listing_text(train_clean)
+test_text_raw  = _combine_listing_text(test_clean)
+
+print(f"Train docs: {len(train_text_raw)}, Test docs: {len(test_text_raw)}")
+```
+
+```{python select-features-tabular}
+# SVD columns are intentionally absent - they are built leak-free inside each CV fold.
+tabular_features = [
+    "regulatory_category", "max_nights_risk_flag",
+    "city", "is_location_exact", "host_experience_proxy",
+    "extra_people",
+    "host_response_rate",
+    "property_type", "room_type", "accommodates", "bedrooms", "bathrooms", "beds",
+    "minimum_nights", "maximum_nights", "amenity_count",
+    "review_scores_rating", "review_scores_value",
+    "longitude_cleansed", "latitude_cleansed", "description_length",
+    "amenity_luxury_count", "amenity_practical_count",
+    "is_multi_listing_host", "total_cost",
+    "listing_id_proxy",
+    "price_vs_neighbourhood_median", "price_per_bedroom", "cleaning_fee_per_night",
+    "has_security_deposit", "security_deposit_per_night",
+    "picture_url_format", "listing_photo_has_original",
+    "monthly_discount_pct", "price_tier", "cleaning_fee_ratio",
+    "desc_luxury_count",
+    "reviews_per_month",
+    "nbhd_median_reviews_per_month", "nbhd_median_review_score",
+    "nbhd_median_price",
+    "nbhd_listing_count",
+    "instant_bookable", "cancellation_policy",
+    "host_identity_verified",
+    "verification_count",
+    "name_length",
+    "host_acceptance_rate", "host_acceptance_rate_missing",
+    "host_response_rate_missing", "host_response_tier",
+]
+
+train_tab = train_clean.select(tabular_features + ["high_booking"]).to_pandas()
+test_tab  = test_clean.select(["unique_id"] + tabular_features).to_pandas()
+
+test_ids = test_tab["unique_id"].astype(int).values
+
+print(train_tab.isnull().sum()[train_tab.isnull().sum() > 0])
+print(test_tab.isnull().sum()[test_tab.isnull().sum() > 0])
+```
+
+```{python catboost-preprocessing}
+# lump rare property types (<1% of listings) to "Other"
+prop_freq  = train_tab["property_type"].value_counts(normalize=True)
+rare_props = set(prop_freq[prop_freq < 0.01].index)
+train_tab["property_type"] = train_tab["property_type"].apply(lambda x: "Other" if x in rare_props else x)
+test_tab["property_type"]  = test_tab["property_type"].apply(lambda x: "Other" if x in rare_props else x)
+
+cat_features = [
+    "regulatory_category", "max_nights_risk_flag", "city", "is_location_exact",
+    "property_type", "room_type",
+    "instant_bookable", "cancellation_policy", "picture_url_format",
+    "host_response_tier", "price_tier",
+]
+for col in cat_features:
+    train_tab[col] = train_tab[col].astype(object).fillna("Unknown")
+    test_tab[col]  = test_tab[col].astype(object).fillna("Unknown")
+
+y     = train_tab["high_booking"].astype(str).astype(int).values
+X_tab = train_tab.drop(columns=["high_booking"])
+X_test_tab = test_tab.drop(columns=["unique_id"])
+```
+
+```{python build-text-svd-helper}
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import TruncatedSVD
+
+def build_text_svd_features(
+    train_text, valid_text, test_text,
+    max_features=5000, n_components=50,
+    ngram_range=(1, 2), min_df=5, random_state=42,
+):
+    tfidf = TfidfVectorizer(
+        max_features=max_features,
+        ngram_range=ngram_range,
+        min_df=min_df,
+        sublinear_tf=True,
+    )
+    svd = TruncatedSVD(n_components=n_components, random_state=random_state)
+
+    tr_tfidf = tfidf.fit_transform(pd.Series(train_text).fillna(""))
+    va_tfidf = tfidf.transform(pd.Series(valid_text).fillna(""))
+    te_tfidf = tfidf.transform(pd.Series(test_text).fillna(""))
+
+    tr_svd = svd.fit_transform(tr_tfidf)
+    va_svd = svd.transform(va_tfidf)
+    te_svd = svd.transform(te_tfidf)
+
+    print(f"  SVD variance explained: {svd.explained_variance_ratio_.sum():.3f}")
+    return tr_svd, va_svd, te_svd
+```
+
+```{python oof-cv-catboost}
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import roc_auc_score
+import catboost as cb
+import numpy as np
+
+N_SVD = 40
+_svd_cols = [f"desc_svd_{i}" for i in range(N_SVD)]
+
+best_params = {
+    "learning_rate":    0.02,
+    "depth":            10,
+    "l2_leaf_reg":      35,
+    "subsample":        0.7471070912992345,
+    "min_data_in_leaf": 226,
+    "rsm":              0.6176715042998242,
+    "random_strength":  0.80,
+}
+
+final_params = {
+    "loss_function":      "Logloss",
+    "eval_metric":        "AUC",
+    "auto_class_weights": "Balanced",
+    "iterations":         2000,
+    "od_wait":            25,
+    "logging_level":      "Silent",
+    "random_seed":        42,
+    **best_params,
+}
+
+n_train = len(X_tab)
+n_test  = len(X_test_tab)
+n_folds = 5
+
+oof_pred        = np.zeros(n_train, dtype=float)
+test_pred_folds = np.zeros((n_folds, n_test), dtype=float)
+best_iterations = []
+
+skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+
+# only do 1 fold
+
+for fold, (tr_idx, va_idx) in enumerate(list(skf.split(X_tab, y))[:1], start=1):
+    print(f"Fold {fold}/1...")
+
+    X_tr_tab = X_tab.iloc[tr_idx].reset_index(drop=True)
+    X_va_tab = X_tab.iloc[va_idx].reset_index(drop=True)
+    y_tr, y_va = y[tr_idx], y[va_idx]
+
+    tr_text = [train_text_raw[i] for i in tr_idx]
+    va_text = [train_text_raw[i] for i in va_idx]
+
+    tr_svd, va_svd, te_svd = build_text_svd_features(tr_text, va_text, test_text_raw,
+                                                       n_components=N_SVD)
+
+    X_tr = pd.concat([
+        X_tr_tab.reset_index(drop=True),
+        pd.DataFrame(tr_svd, columns=_svd_cols),
+    ], axis=1)
+    X_va = pd.concat([
+        X_va_tab.reset_index(drop=True),
+        pd.DataFrame(va_svd, columns=_svd_cols),
+    ], axis=1)
+    X_te = pd.concat([
+        X_test_tab.reset_index(drop=True),
+        pd.DataFrame(te_svd, columns=_svd_cols),
+    ], axis=1)
+
+    tr_pool = cb.Pool(X_tr, label=y_tr, cat_features=cat_features)
+    va_pool = cb.Pool(X_va, label=y_va, cat_features=cat_features)
+    te_pool = cb.Pool(X_te,              cat_features=cat_features)
+
+    model = cb.CatBoostClassifier(**final_params)
+    model.fit(tr_pool, eval_set=va_pool, use_best_model=True)
+
+    oof_pred[va_idx] = model.predict_proba(va_pool)[:, 1]
+    test_pred_folds[fold - 1] = model.predict_proba(te_pool)[:, 1]
+    best_iterations.append(model.best_iteration_)
+
+    fold_auc = roc_auc_score(y_va, oof_pred[va_idx])
+    print(f"  Fold {fold} AUC: {fold_auc:.5f} | best_iteration: {model.best_iteration_}")
+
+cv_auc   = roc_auc_score(y, oof_pred)
+test_pred = test_pred_folds[:fold].mean(axis=0)  # only average completed folds
+mean_iter = int(np.mean(best_iterations))
+
+print(f"\nOOF CV AUC: {cv_auc:.5f}")
+print(f"Mean best iteration: {mean_iter}")
+```
+
+```{python feature-importance}
+#| eval: false
+# Uses model and X_va/y_va from the last fold of oof-cv-catboost
+importance_pool = cb.Pool(X_va, label=y_va, cat_features=cat_features)
+
+importance_df = pd.DataFrame({
+    "feature":    X_va.columns.tolist(),
+    "importance": model.get_feature_importance(importance_pool)
+}).sort_values("importance", ascending=False)
+
+print(importance_df.to_string())
+
+importance_df.plot.barh(x="feature", y="importance", figsize=(10, 12), legend=False, color="steelblue")
+plt.gca().invert_yaxis()
+plt.title("CatBoost Feature Importance (last fold)")
+plt.tight_layout()
+plt.show()
+
+# SHAP values
+shap_vals = model.get_feature_importance(
+    cb.Pool(X_va, label=y_va, cat_features=cat_features),
+    type="ShapValues"
+)
+shap_df = pd.DataFrame(shap_vals[:, :-1], columns=X_va.columns)
+
+shap_importance = shap_df.abs().mean().sort_values(ascending=False)
+shap_direction  = shap_df.mean().reindex(shap_importance.index)
+
+print(shap_importance.to_string())
+print(shap_direction.to_string())
+```
+
+
+```{python build-submission}
+import pandas as pd
+
+sub_oof = pd.DataFrame({"unique_id": test_ids, "high_booking": test_pred})
+sub_oof.to_csv("submission-catboost-oof-avg.csv", index=False)
+print("Wrote submission-catboost-oof-avg.csv")
+```

@@ -1,0 +1,305 @@
+
+```{r library-setup}
+#| output: false
+# libraries
+library(tidyverse)
+library(tidymodels)
+library(vetiver)
+library(plumber)
+library(tidytable)
+library(bonsai)
+library(lightgbm)
+library(pins)
+library(beepr)
+library(GPfit)
+library(lhs)
+library(dials)
+library(caret)
+library(parallel)
+library(vip)
+library(gtools)
+
+# set seed
+set.seed(21)
+
+```
+
+
+```{r data-loading}
+airbnb_pop <- fread("C:/Users/ramse/msba-courses/ds 810/airbnb-project/part-two/data/airbnb-project-paris-sampled-Popincourt.csv")
+
+glimpse(airbnb_pop)
+```
+
+```{r check-na}
+# check na's in each column
+colSums(is.na(airbnb_pop))
+```
+
+```{r data-preprocessing-for-logistic-regression}
+# use only these varialbles for modeling
+airbnb_pop <- airbnb_pop %>% 
+    select(c(
+        id, date, high_booking, host_id, host_since, host_location, host_response_time, host_response_rate, host_is_superhost, street, latitude, longitude, property_type, room_type, accommodates, bathrooms, bedrooms, beds, bed_type, square_feet, price, weekly_price, monthly_price, guests_included, extra_people, minimum_nights, maximum_nights, review_scores_rating, review_scores_accuracy, review_scores_cleanliness, review_scores_checkin, review_scores_communication, review_scores_location, review_scores_value, reviews_per_month, host_listings_count, host_total_listings_count, amenities, security_deposit, cleaning_fee, instant_bookable, minimum_minimum_nights, maximum_minimum_nights, minimum_maximum_nights, maximum_maximum_nights, minimum_nights_avg_ntm, maximum_nights_avg_ntm, latitude_cleansed, longitude_cleansed
+    ))
+
+glimpse(airbnb_pop)
+
+# clean variable types
+airbnb_pop <- airbnb_pop %>% 
+    mutate(
+        id = as.numeric(id),
+        high_booking = as.factor(high_booking),
+        date = as.Date(date),
+        host_since = as.Date(host_since),
+        host_tenure_days = as.numeric(date - host_since),
+        listing_month = as.factor(format(date, "%m")),
+        host_country = trimws(sub(".*,", "", host_location)),
+        host_country = dplyr::recode(host_country,
+            # ISO-2 country codes
+            "FR" = "France",
+            "DE" = "Germany",
+            "GB" = "United Kingdom",
+            "BE" = "Belgium",
+            "CH" = "Switzerland",
+            "ES" = "Spain",
+            "IE" = "Ireland",
+            "IN" = "India",
+            "JP" = "Japan",
+            "HK" = "Hong Kong",
+            "DK" = "Denmark",
+            "KG" = "Kyrgyzstan",
+            "CM" = "Cameroon",
+            "PT" = "Portugal",
+            "QA" = "Qatar",
+            "RS" = "Serbia",
+            "AL" = "Albania",
+            "FI" = "Finland",
+            # US state codes (from "City, ST" entries)
+            "NY" = "United States",
+            "CA" = "United States",
+            "TX" = "United States",
+            # Non-standard / city-only entries
+            "LONDON" = "United Kingdom",
+            "London" = "United Kingdom",
+            "quebec" = "Canada"
+        ),
+        host_country = as.factor(host_country),
+        host_response_time = as.factor(ifelse(host_response_time == "N/A", NA, as.character(host_response_time))),
+        host_response_rate = as.numeric(gsub("%", "", host_response_rate)),
+        host_is_superhost = as.factor(host_is_superhost),
+        street_name = as.factor(sub(",.*", "", street)),
+        property_type = as.factor(property_type),
+        room_type = as.factor(room_type),
+        bed_type = as.factor(bed_type),
+        weekly_price = as.numeric(gsub("[$,]", "", weekly_price)),
+        monthly_price = as.numeric(gsub("[$,]", "", monthly_price)),
+        extra_people = as.numeric(gsub("[$,]", "", extra_people)),
+        security_deposit = as.numeric(gsub("[$,]", "", security_deposit)),
+        cleaning_fee = as.numeric(gsub("[$,]", "", cleaning_fee)),
+        instant_bookable = as.factor(instant_bookable),
+        price = as.numeric(gsub("[$,]", "", price)),
+        price_per_person = price / accommodates,
+        amenity_count = ifelse(is.na(amenities), 0, lengths(strsplit(as.character(amenities), ","))),
+        reviews_x_rating = reviews_per_month * review_scores_rating,
+        price_x_bedrooms = price / (bedrooms + 1),
+        )
+
+# ensure these are all the correct data types
+glimpse(airbnb_pop)
+```
+
+```{r select-features}
+# select features
+airbnb_features <- airbnb_pop %>%
+    select(c(
+        # target
+        high_booking,
+        # host features
+        host_tenure_days,
+        host_country,
+        host_response_time,
+        host_response_rate,
+        host_is_superhost,
+        host_listings_count,
+        host_total_listings_count,
+        # listing features
+        listing_month,
+        street_name,
+        property_type,
+        room_type,
+        accommodates,
+        bathrooms,
+        bedrooms,
+        beds,
+        bed_type,
+        latitude_cleansed,
+        longitude_cleansed,
+        # pricing features
+        price,
+        price_per_person,
+        price_x_bedrooms,
+        extra_people,
+        # booking policies
+        guests_included,
+        minimum_nights,
+        maximum_nights,
+        instant_bookable,
+        # review features
+        review_scores_rating,
+        review_scores_accuracy,
+        review_scores_cleanliness,
+        review_scores_checkin,
+        review_scores_communication,
+        review_scores_location,
+        review_scores_value,
+        reviews_per_month,
+        reviews_x_rating,
+        # amenity features
+        amenity_count
+    ))
+```
+
+```{r check-na-features}
+# check for missing values
+colSums(is.na(airbnb_features))
+```
+
+```{r train-test-split}
+# train/test split stratified on target
+airbnb_split <- initial_split(airbnb_features, prop = 0.8, strata = high_booking)
+
+airbnb_train <- training(airbnb_split)
+airbnb_test <- testing(airbnb_split)
+```
+
+```{r recipe}
+airbnb_recipe <- recipe(high_booking ~ ., data = airbnb_train) %>%
+
+    # feature engineering
+    # flag listings with no reviews before imputing scores
+    step_mutate(has_reviews = as.factor(ifelse(is.na(reviews_per_month), 0, 1))) %>%
+
+    # imputation
+    # review scores: missing = no reviews yet, impute with 0
+    step_impute_median(
+        review_scores_rating, review_scores_accuracy, review_scores_cleanliness,
+        review_scores_checkin, review_scores_communication, review_scores_location,
+        review_scores_value, reviews_per_month, reviews_x_rating
+    ) %>%
+    # street_name: spatial nearest-neighbor using lat/long
+    step_impute_knn(
+        street_name,
+        impute_with = imp_vars(latitude_cleansed, longitude_cleansed),
+        neighbors = 1
+    ) %>%
+    # remaining numeric: median
+    step_impute_median(all_numeric_predictors()) %>%
+    # remaining nominal: mode
+    step_impute_mode(all_nominal_predictors(), -all_outcomes()) %>%
+
+    # handle high-cardinality factors
+    step_other(street_name, threshold = 0.01) %>%
+    step_other(host_country, threshold = 0.01) %>%
+
+    # encoding
+    step_dummy(all_nominal_predictors()) %>%
+
+    # cleanup
+    step_zv(all_predictors()) %>%
+    step_normalize(all_numeric_predictors())
+```
+
+```{r logistic-regression-v1}
+# model spec
+logistic_spec <- logistic_reg() %>%
+    set_engine("glm") %>%
+    set_mode("classification")
+
+# workflow
+airbnb_workflow <- workflow() %>%
+    add_recipe(airbnb_recipe) %>%
+    add_model(logistic_spec)
+
+# fit
+logistic_fit <- airbnb_workflow %>%
+    fit(data = airbnb_train)
+
+tidy(logistic_fit) %>% 
+    mutate(signif = stars.pval(p.value)) %>%
+    print(n = Inf)
+
+# filter for only significant predictors
+tidy(logistic_fit) %>% 
+    mutate(signif = stars.pval(p.value)) %>%
+    filter(signif %in% c("*", "**", "***")) %>%
+    print(n = Inf, width = Inf)
+```
+
+
+
+## Logistic Regression: Coefficient Interpretation
+
+The model identified **57 statistically significant predictors** (p < 0.05) of high booking activity. The coefficients below are on the log-odds scale, where positive values increase the probability of high booking and negative values decrease it.
+
+### Pricing
+
+All three price variables `price`, `price_per_person`, and `price_x_bedrooms` are strongly negative, with `price_per_person` carrying the largest effect (−1.09). This is the single clearest signal in the model: higher per-guest cost reduces booking likelihood. Listings with lower prices relative to their capacity and bedroom count consistently outperform.
+
+### Stay Requirements
+
+Both `minimum_nights` (0.226) and `maximum_nights` (0.194) are positive and among the strongest predictors. This likely reflects that high-booking listings tend to attract longer-term stays, guests who commit to a stay are less likely to cancel and more likely to rebook.
+
+### Host Behavior
+
+`host_response_rate` (0.283) and `host_response_time_within.an.hour` (0.389) are both positively associated with high booking. Hosts who respond quickly and consistently drive more conversions. Interestingly, `host_is_superhost` is negative (−0.125), which may reflect that superhosts price at a premium, reducing booking volume despite higher quality.
+
+### Reviews
+
+`reviews_per_month` (−0.816) and `review_scores_rating` (−0.810) are both strongly negative, seemingly counterintuitive. The likely explanation is that high-booking listings tend to be newer or more available, and therefore have fewer accumulated reviews. `has_reviews_X1` being negative (−0.124) supports this: listings *without* any reviews have a higher predicted booking rate, consistent with newer listings receiving more initial traffic. `review_scores_value` is the exception, with a positive effect (0.538), confirming that perceived value matters more to guests than overall rating.
+
+### Location & Property Type
+
+`street_name_Paris` is a strong positive predictor (0.366), indicating centrally-addressed listings outperform. Among property types, `Entire.apartment` is positive (0.101) while `Entire.rental.unit` (−0.326) and `Entire.loft` (−0.099) reduce booking probability. Guests prefer traditional apartment-style listings. Shared and private room types are all negative relative to the baseline, consistent with guests preferring full properties.
+
+### Seasonality
+
+Listing months May through August are all negative relative to the reference month, with July showing the largest drop (−0.124). This may reflect increased supply during peak summer months, making it harder for individual listings to stand out.
+
+### Amenities
+
+`amenity_count` is negative (−0.196), which is unexpected. A likely explanation is that listings with many amenities are priced higher, and the negative price effect dominates. It may also reflect that heavily-listed amenities signal a more commercialized listing that guests are less drawn to.
+
+```{r roc-auc}
+# predictions on test set
+logistic_test_results <- airbnb_test %>%
+    bind_cols(
+        predict(logistic_fit, airbnb_test, type = "prob"),
+        predict(logistic_fit, airbnb_test, type = "class")
+    )
+
+# ROC curve and AUC
+roc_curve_data <- roc_curve(
+    data = logistic_test_results,
+    truth = high_booking,
+    .pred_1,
+    event_level = "second"
+)
+roc_auc_val <- roc_auc(
+    data = logistic_test_results,
+    truth = high_booking,
+    .pred_1,
+    event_level = "second"
+)
+
+# print results
+print(roc_curve_data)
+print(roc_auc_val)
+```
+
+## Model Performance
+
+The logistic regression model achieved an AUC of **0.859** on the held-out test set, indicating strong discriminative ability between high and non-high booking listings. An AUC in the 0.80–0.90 range is generally considered good, meaning the model correctly ranks a randomly chosen high-booking listing above a randomly chosen non-high-booking listing approximately 86% of the time.
+
+This is a notable result for a baseline logistic regression with no hyperparameter tuning, suggesting the engineered features, particularly pricing variables, stay requirements, and review activity contain substantial predictive signal. The model provides a solid foundation for comparison against more complex approaches such as regularized regression or tree-based models.
+

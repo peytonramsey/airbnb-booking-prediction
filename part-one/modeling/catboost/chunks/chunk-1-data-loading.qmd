@@ -1,0 +1,120 @@
+
+```{r library-setup}
+#| output: false
+# libraries
+library(tidyverse)
+library(tidymodels)
+library(vetiver)
+library(plumber)
+library(tidytable)
+library(pins)
+library(beepr)
+library(GPfit)
+library(lhs)
+library(dials)
+library(caret)
+library(parallel)
+library(vip)
+library(bonsai)
+library(catboost)
+library(dplyr)
+library(purrr)
+library(readr)
+library(embed)
+
+
+# set seed
+set.seed(21)
+```
+
+```{r load-train-data}
+# load train data
+train_data <- fread("C:\\Users\\ramse\\msba-courses\\ds 810\\data\\airbnb-project-msba-kaggle-train.csv", na = c("", "NA", "N/A", "n/a", "-"))
+```
+
+```{r clean-train-data}
+# apply same cleaning pipeline as test set
+train_clean <- train_data %>%
+    select(c(
+        high_booking, host_id, host_location, host_response_time, host_response_rate, host_is_superhost, latitude, longitude, property_type, room_type, accommodates, bathrooms, bedrooms, beds, bed_type, square_feet, price, weekly_price, monthly_price, guests_included, extra_people, minimum_nights, maximum_nights, review_scores_rating, review_scores_accuracy, review_scores_cleanliness, review_scores_checkin, review_scores_communication, review_scores_location, review_scores_value, reviews_per_month, host_listings_count, host_total_listings_count, amenities, security_deposit, cleaning_fee, instant_bookable, latitude_cleansed, longitude_cleansed, host_name, host_about, host_acceptance_rate, cancellation_policy, zipcode, name, description, neighbourhood_cleansed, is_location_exact
+    ))
+
+train_clean <- train_clean %>%
+    mutate(
+        high_booking = factor(as.integer(as.character(high_booking)), levels = c(0L, 1L)),
+        host_response_time = as.factor(ifelse(host_response_time == "N/A", NA, as.character(host_response_time))),
+        host_response_rate = as.numeric(gsub("%", "", host_response_rate)),
+        host_is_superhost = as.factor(host_is_superhost),
+        property_type = as.factor(property_type),
+        room_type = as.factor(room_type),
+        bed_type = as.factor(bed_type),
+        weekly_price = as.numeric(gsub("[$,]", "", weekly_price)),
+        monthly_price = as.numeric(gsub("[$,]", "", monthly_price)),
+        extra_people = as.numeric(gsub("[$,]", "", extra_people)),
+        security_deposit = as.numeric(gsub("[$,]", "", security_deposit)),
+        cleaning_fee = as.numeric(gsub("[$,]", "", cleaning_fee)),
+        instant_bookable = as.factor(instant_bookable),
+        price = as.numeric(gsub("[$,]", "", price)),
+        price_per_person = price / pmax(accommodates, 1),
+        amenity_count = ifelse(is.na(amenities), 0, lengths(strsplit(as.character(amenities), ","))),
+        zipcode = as.factor(zipcode),
+        is_location_exact = as.factor(is_location_exact),
+        host_acceptance_rate = as.numeric(gsub("%", "", host_response_rate))
+    )
+
+glimpse(train_clean)
+nrow(train_clean)
+ncol(train_clean)
+```
+
+```{r load-test-data}
+# load data using 'tidytable'
+airbnb_data <- fread("C:\\Users\\ramse\\msba-courses\\ds 810\\data\\airbnb-project-msba-kaggle-test.csv", na = c("", "NA", "N/A", "n/a", "-"))
+glimpse(airbnb_data)
+
+colSums(is.na(airbnb_data))
+
+```
+
+```{r clean-test-data}
+# select relevant columns
+test_clean <- airbnb_data %>%
+    select(c(
+        unique_id, host_id, host_location, host_response_time, host_response_rate, host_is_superhost, latitude, longitude, property_type, room_type, accommodates, bathrooms, bedrooms, beds, bed_type, square_feet, price, weekly_price, monthly_price, guests_included, extra_people, minimum_nights, maximum_nights, review_scores_rating, review_scores_accuracy, review_scores_cleanliness, review_scores_checkin, review_scores_communication, review_scores_location, review_scores_value, reviews_per_month, host_listings_count, host_total_listings_count, amenities, security_deposit, cleaning_fee, instant_bookable, latitude_cleansed, longitude_cleansed, host_name, host_about, host_acceptance_rate, cancellation_policy, zipcode, name, description, neighbourhood_cleansed, is_location_exact 
+    ))
+
+glimpse(test_clean)
+
+# check na values
+colSums(is.na(test_clean))
+
+# check dimensions
+nrow(test_clean)
+ncol(test_clean)
+
+# clean test data
+test_clean <- test_clean %>%
+    mutate(
+        unique_id = as.numeric(unique_id),
+        host_response_time = as.factor(ifelse(host_response_time == "N/A", NA, as.character(host_response_time))),
+        host_response_rate = as.numeric(gsub("%", "", host_response_rate)),
+        host_is_superhost = as.factor(host_is_superhost),
+        property_type = as.factor(property_type),
+        room_type = as.factor(room_type),
+        bed_type = as.factor(bed_type),
+        weekly_price = as.numeric(gsub("[$,]", "", weekly_price)),
+        monthly_price = as.numeric(gsub("[$,]", "", monthly_price)),
+        extra_people = as.numeric(gsub("[$,]", "", extra_people)),
+        security_deposit = as.numeric(gsub("[$,]", "", security_deposit)),
+        cleaning_fee = as.numeric(gsub("[$,]", "", cleaning_fee)),
+        instant_bookable = as.factor(instant_bookable),
+        price = as.numeric(gsub("[$,]", "", price)),
+        price_per_person = price / pmax(accommodates, 1),
+        amenity_count = ifelse(is.na(amenities), 0, lengths(strsplit(as.character(amenities), ","))),
+        zipcode = as.factor(zipcode),
+        is_location_exact = as.factor(is_location_exact),
+        host_acceptance_rate = as.numeric(gsub("%", "", host_response_rate))
+    )
+
+glimpse(test_clean)
+```

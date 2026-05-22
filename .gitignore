@@ -1,0 +1,15 @@
+# quarto render outputs
+*_files/
+*.html
+*.pdf
+
+# data files (too large for github)
+*.csv
+*.tsv
+
+# catboost training artifacts
+catboost_info/
+*.cbm
+
+# other generated outputs
+*.md

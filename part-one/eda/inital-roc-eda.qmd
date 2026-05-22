@@ -1,0 +1,74 @@
+```{r}
+#| output: false
+# libraries
+library(tidyverse)
+library(tidymodels)
+library(vetiver)
+library(plumber)
+library(tidytable)
+library(bonsai)
+library(lightgbm)
+
+# set seed
+set.seed(21)
+```
+
+```{r}
+# load data using 'tidytable'
+airbnb_data <- fread("C:\\Users\\ramse\\msba-courses\\ds 810\\data\\airbnb-project-msba-kaggle-test.csv")
+head(airbnb_data)
+glimpse(airbnb_data)
+colSums(is.na(airbnb_data))
+```
+
+```{r}
+# clean data
+airbnb_data_clean <- airbnb_data %>%
+    select(c(unique_id, state, city, host_is_superhost, neighbourhood_cleansed, property_type, room_type, accommodates, bedrooms, beds, price, minimum_nights, maximum_nights, review_scores_rating, reviews_per_month, host_identity_verified, latitude_cleansed, longitude_cleansed, host_response_rate)) %>%
+    mutate(
+        price = as.numeric(gsub("[$,]", "", price)),
+        host_response_rate = as.numeric(gsub("%", "", host_response_rate))
+    ) %>%
+    mutate(across(where(is.character), as.factor))
+glimpse(airbnb_data_clean)
+
+# check na values
+colSums(is.na(airbnb_data_clean))
+
+# check dimensions
+nrow(airbnb_data_clean)
+ncol(airbnb_data_clean)
+```
+
+```{r}
+# load train data
+train_data <- fread("C:\\Users\\ramse\\msba-courses\\ds 810\\data\\airbnb-project-msba-kaggle-train.csv")
+
+# apply same cleaning pipeline as test set
+train_clean <- train_data %>%
+    select(c(high_booking, state, city, host_is_superhost, neighbourhood_cleansed, property_type, room_type, accommodates, bedrooms, beds, price, minimum_nights, maximum_nights, review_scores_rating, reviews_per_month, host_identity_verified, latitude_cleansed, longitude_cleansed, host_response_rate)) %>%
+    mutate(
+        price = as.numeric(gsub("[$,]", "", price)),
+        host_response_rate = as.numeric(gsub("%", "", host_response_rate)),
+        high_booking = as.factor(high_booking)
+    ) %>%
+    mutate(across(where(is.character), as.factor))
+
+glimpse(train_clean)
+nrow(train_clean)
+ncol(train_clean)
+```
+
+
+```{r}
+library(vetiver)
+library(pins)
+
+board <- board_folder("C:/Users/ramse/msba-courses/ds 810/airbnb-project/part-one/models/airbnb-lightgbm", versioned = TRUE)
+
+pin_list(board)
+
+pin_versions(board, "airbnb-lightgbm")
+pin_meta(board, "airbnb-lightgbm")
+
+```
